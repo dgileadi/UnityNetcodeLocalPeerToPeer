@@ -1,0 +1,22 @@
+{
+    "name": "com.community.netcode.transport.multipeerconnectivity",
+    "rootNamespace": "Netcode.Transports.MultipeerConnectivity",
+    "references": [
+        "Unity.Netcode.Runtime",
+        "com.community.netcode.localpeertopeer"
+    ],
+    "includePlatforms": [
+        "Editor",
+        "iOS",
+        "macOSStandalone",
+        "tvOS"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

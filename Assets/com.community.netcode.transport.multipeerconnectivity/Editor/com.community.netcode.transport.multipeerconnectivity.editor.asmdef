@@ -1,0 +1,18 @@
+{
+    "name": "com.community.netcode.transport.multipeerconnectivity.editor",
+    "rootNamespace": "",
+    "references": [
+        "com.community.netcode.transport.multipeerconnectivity"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

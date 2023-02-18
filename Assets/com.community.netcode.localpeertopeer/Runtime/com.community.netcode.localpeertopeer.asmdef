@@ -1,0 +1,22 @@
+{
+    "name": "com.community.netcode.localpeertopeer",
+    "rootNamespace": "Netcode.LocalPeerToPeer",
+    "references": [
+        "Unity.Netcode.Runtime"
+    ],
+    "includePlatforms": [
+        "Android",
+        "Editor",
+        "iOS",
+        "macOSStandalone",
+        "tvOS"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

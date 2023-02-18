@@ -1,0 +1,20 @@
+{
+    "name": "com.community.netcode.transport.nearbyconnections",
+    "rootNamespace": "Netcode.Transports.NearbyConnections",
+    "references": [
+        "Unity.Netcode.Runtime",
+        "com.community.netcode.localpeertopeer"
+    ],
+    "includePlatforms": [
+        "Android",
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
