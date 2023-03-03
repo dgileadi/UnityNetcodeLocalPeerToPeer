@@ -47,7 +47,7 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         public ulong maximumNumberOfPeers => GetMaximumNumberOfPeers();
 
-        public MCSession(Guid peerID, string displayName, LocalP2PTransport.PeerMode mode, string serviceType)
+        public MCSession(Guid peerID, string displayName, PeerMode mode, string serviceType)
         {
             if (displayName == null)
                 throw new ArgumentNullException(nameof(displayName));
@@ -90,6 +90,30 @@ namespace Netcode.Transports.MultipeerConnectivity
             {
                 if (error.Valid)
                     throw error.ToException();
+            }
+        }
+
+        public void InviteDiscoveredPeer(string peerID)
+        {
+            if (!created)
+                throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
+
+            using (var peerID_NSString = new NSString(peerID))
+            using (var error = InviteDiscoveredPeer(this, peerID_NSString))
+            {
+                if (error.Valid)
+                    throw error.ToException();
+            }
+        }
+
+        public void RejectDiscoveredPeer(string peerID)
+        {
+            if (!created)
+                throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
+
+            using (var peerID_NSString = new NSString(peerID))
+            {
+                RejectDiscoveredPeer(this, peerID_NSString);
             }
         }
 
@@ -165,6 +189,12 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         [DllImport("__Internal", EntryPoint="UnityMC_Delegate_initWithPeerInfo")]
         static extern IntPtr InitWithPeerInfo(MCPeerInfo peerInfo, NSString serviceType);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_inviteDiscoveredPeer")]
+        static extern NSError InviteDiscoveredPeer(MCSession self, NSString peerID);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_rejectDiscoveredPeer")]
+        static extern void RejectDiscoveredPeer(MCSession self, NSString peerID);
 
         [DllImport("__Internal", EntryPoint="UnityMC_Delegate_receivedDataQueueSize")]
         static extern int GetReceivedDataQueueSize(MCSession self);

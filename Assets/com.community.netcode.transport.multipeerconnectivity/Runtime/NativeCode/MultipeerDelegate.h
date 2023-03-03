@@ -6,6 +6,8 @@
 - (nullable instancetype)initWithPeerInfo:(nonnull PeerInfo *)peerInfo serviceType:(nonnull NSString *)serviceType;
 - (nullable NSError*)sendToAllPeers:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode;
 - (nullable NSError*)sendToPeerID:(nonnull NSString *)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode;
+- (nullable NSError*)inviteDiscoveredPeer:(nonnull NSString *)peerID;
+- (void)rejectDiscoveredPeer:(nonnull NSString *)peerID;
 - (NSUInteger)discoveredQueueSize;
 - (nonnull PeerInfo*)dequeueDiscoveredPeer;
 - (NSUInteger)connectedQueueSize;

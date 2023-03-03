@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace Netcode.Transports.MultipeerConnectivity
 {
     [StructLayout(LayoutKind.Sequential)]
-    public struct MCPeerInfo : LocalP2PTransport.PeerInfo, IDisposable, IEquatable<MCPeerInfo>
+    public struct MCPeerInfo : PeerInfo, IDisposable, IEquatable<MCPeerInfo>
     {
         IntPtr m_Ptr;
 
@@ -39,9 +39,9 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public LocalP2PTransport.PeerMode StartMode => (LocalP2PTransport.PeerMode)GetMode(this);
+        public PeerMode StartMode => (PeerMode)GetMode(this);
 
-        public MCPeerInfo(Guid peerID, string displayName, LocalP2PTransport.PeerMode mode)
+        public MCPeerInfo(Guid peerID, string displayName, PeerMode mode)
         {
             if (displayName == null)
                 throw new ArgumentNullException(nameof(displayName));

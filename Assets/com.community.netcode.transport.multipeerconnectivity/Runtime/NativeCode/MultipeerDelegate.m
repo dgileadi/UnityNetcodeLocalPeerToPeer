@@ -1,11 +1,7 @@
 #import "MultipeerDelegate.h"
 
-// TODO: better support lots of connected devices as described by
-// https://stackoverflow.com/questions/19479295/multipeer-connectivity-framework-for-up-to-45-devices/37883399#37883399
-
 @implementation MultipeerDelegate
 
-NSString* k_DiscoveryInfoKey = @"di";
 MCSession* m_Session;
 MCPeerID* m_PeerID;
 PeerInfo* m_PeerInfo;
@@ -112,20 +108,23 @@ BOOL m_Browsing;
     return error;
 }
 
+- (MCPeerID *)findMCPeerID(nonnull NSString *)peerID
+{
+    @synchronized (m_PeerInfoByID)
+    {
+        for (MCPeerID *key in m_PeerInfoByID)
+            if ([peerID isEqual(m_PeerInfoByID[key].peerID))
+                return key;
+    }
+    return nil;
+}
+
 - (NSError*)sendToPeerID(nonnull NSString*)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode
 {
     if (m_Session.connectedPeers.count == 0)
         return nil;
 
-    MCPeerID* peer = nil;
-    for (MCPeerID *key in m_PeerInfoByID) {
-        if ([peerID isEqual(m_PeerInfoByID[key].peerID))
-        {
-            peer = key;
-            break;
-        }
-    }
-
+    MCPeerID* peer = [findMCPeerID peerID];
     if (peer == nil)
         return nil;
 
@@ -268,10 +267,15 @@ BOOL m_Browsing;
 
 - (void)session:(nonnull MCSession *)session didReceiveData:(nonnull NSData *)data fromPeer:(nonnull MCPeerID *)mcPeerID
 {
+    PeerInfo *peer;
+    @synchronized (m_PeerInfoByID)
+    {
+        peer = m_PeerInfoByID[mcPeerID];
+    }
+    PeerMessage *peerMessage = [[PeerMessage alloc] initWithPeerID:peer.peerID data:data];
+
     @synchronized (m_Queue)
     {
-        PeerInfo *peer = m_PeerInfoByID[mcPeerID];
-        PeerMessage *peerMessage = [[PeerMessage alloc] initWithPeerID:peer.peerID data:data];
         [m_Queue addObject:peerMessage];
     }
 }
@@ -293,7 +297,11 @@ BOOL m_Browsing;
 
 - (void)session:(nonnull MCSession *)session peer:(nonnull MCPeerID *)mcPeerID didChangeState:(MCSessionState)state
 {
-    PeerInfo *peerInfo = m_PeerInfoByID[mcPeerID];
+    PeerInfo *peerInfo;
+    @synchronized (m_PeerInfoByID)
+    {
+        peerInfo = m_PeerInfoByID[mcPeerID];
+    }
     if (!peerInfo) { return; }
 
     if (state == MCSessionStateConnected)
@@ -305,12 +313,15 @@ BOOL m_Browsing;
     }
     else if (state == MCSessionStateNotConnected)
     {
-        [m_PeerInfoByID removeObjectForKey:mcPeerID];
+        @synchronized (m_PeerInfoByID)
+        {
+            [m_PeerInfoByID removeObjectForKey:mcPeerID];
 
-        // if the same peer has already reconnected, don't fire
-        for (MCPeerID* key in m_PeerInfoByID) {
-            if ([peerInfo.peerID isEqual:m_PeerInfoByID[key].peerID])
-                return;
+            // if the same peer has already reconnected, don't fire
+            for (MCPeerID* key in m_PeerInfoByID) {
+                if ([peerInfo.peerID isEqual:m_PeerInfoByID[key].peerID])
+                    return;
+            }
         }
 
         @synchronized (m_DisconnectedQueue)
@@ -324,12 +335,25 @@ BOOL m_Browsing;
 {
     PeerInfo *peerInfo = [NSKeyedUnarchiver unarchivedObjectOfClass:[PeerInfo class] fromData:context error:nil];
     peerInfo.displayName = mcPeerID.displayName;
-    BOOL shouldAccept = ([peerInfo.peerID compare:m_PeerInfo.peerID] == NSOrderedDescending) && ![m_Session.connectedPeers containsObject:mcPeerID];
 
+    BOOL knownByID;
     @synchronized (m_PeerInfoByID)
     {
-        if (![m_PeerInfoByID objectForKey:mcPeerID])
+        knownByID = [m_PeerInfoByID objectForKey:mcPeerID] != nil;
+    }
+
+    // Don't accept if we're already connected
+    // Always accept if we haven't sent our own invitation to the peer
+    // Otherwise accept if our ID is lower than theirs so that only one peer accepts
+    BOOL shouldAccept = ![m_Session.connectedPeers containsObject:mcPeerID] &&
+            ((!knownByID) || [peerInfo.peerID compare:m_PeerInfo.peerID] == NSOrderedDescending);
+
+    if (!knownByID)
+    {
+        @synchronized (m_PeerInfoByID)
+        {
             [m_PeerInfoByID setObject:peerUserID forKey:mcPeerID];
+        }
     }
 
     invitationHandler(shouldAccept, m_Session);
@@ -338,11 +362,17 @@ BOOL m_Browsing;
 - (void)advertiser:(MCNearbyServiceAdvertiser *)advertiser didNotStartAdvertisingPeer:(NSError *)error
 {
     NSLog(@"Unable to advertise peer: %@", error);
-    [m_ErrorQueue addObject:error];
+    @synchronized (m_ErrorQueue)
+    {
+        [m_ErrorQueue addObject:error];
+    }
 }
 
 - (void)browser:(nonnull MCNearbyServiceBrowser *)browser foundPeer:(nonnull MCPeerID *)mcPeerID withDiscoveryInfo:(nullable NSDictionary<NSString *,NSString *> *)info
 {
+    if ([m_Session.connectedPeers containsObject:mcPeerID])
+        return;
+
     PeerInfo *peerInfo = [[PeerInfo alloc] initWithDiscoveryInfo:info displayName:mcPeerID.displayName];
 
     @synchronized (m_PeerInfoByID)
@@ -355,25 +385,54 @@ BOOL m_Browsing;
     {
         [m_DiscoveredQueue addObject:peerInfo];
     }
+}
 
-    NSData *context = [NSKeyedArchiver archivedDataWithRootObject:peerInfo requiringSecureCoding:FALSE error:nil];
+- (NSError*)inviteDiscoveredPeer:(nonnull NSString *)peerID
+{
+    MCPeerID *mcPeerID = [findMCPeerID peerID];
+    if (mcPeerID == nil)
+    {
+        NSString *description = [NSString stringWithFormat:@"Unable to find an MCPeerID for ID string %@", peerID];
+        NSDictionary *userInfo = @{ NSLocalizedDescriptionKey : description };
+        return [NSError errorWithDomain:@"Netcode.Transports.MultipeerConnectivity.ErrorDomain" code:-404 userInfo:nil];
+    }
+
+    NSData *context = [NSKeyedArchiver archivedDataWithRootObject:m_PeerInfo requiringSecureCoding:FALSE error:nil];
 
     // Invite the peer to join our session
     [browser invitePeer:mcPeerID
               toSession:m_Session
             withContext:context
                 timeout:10];
+
+    return nil;
+}
+
+- (void)rejectDiscoveredPeer:(nonnull NSString *)peerID
+{
+    @synchronized (m_PeerInfoByID)
+    {
+        for (MCPeerID *key in m_PeerInfoByID)
+            if ([peerID isEqual(m_PeerInfoByID[key].peerID))
+                [m_PeerInfoByID removeObjectForKey:key];
+    }
 }
 
 - (void)browser:(nonnull MCNearbyServiceBrowser *)browser lostPeer:(nonnull MCPeerID *)mcPeerID
 {
-    // Not used
+    @synchronized (m_PeerInfoByID)
+    {
+        [m_PeerInfoByID removeObjectForKey:mcPeerID];
+    }
 }
 
 - (void)browser:(MCNearbyServiceBrowser *)browser didNotStartBrowsingForPeers:(NSError *)error
 {
     NSLog(@"Unable to browse for peers: %@", error);
-    [m_ErrorQueue addObject:error];
+    @synchronized (m_ErrorQueue)
+    {
+        [m_ErrorQueue addObject:error];
+    }
 }
 
 @end

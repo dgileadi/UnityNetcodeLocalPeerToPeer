@@ -34,6 +34,22 @@ namespace Netcode.Transports.MultipeerConnectivity
             return new NSData(CreateWithBytesNoCopy(ptr, bytes.Length, false));
         }
 
+        public static unsafe NSData CreateWithBytes(ArraySegment<byte> bytes)
+        {
+            using (var handle = bytes.AsMemory().Pin())
+            {
+                return new NSData(CreateWithBytes(handle.Pointer, bytes.Count));
+            }
+        }
+
+        public static unsafe NSData CreateWithBytesNoCopy(ArraySegment<byte> bytes)
+        {
+            using (var handle = bytes.AsMemory().Pin())
+            {
+                return new NSData(CreateWithBytesNoCopy(handle.Pointer, bytes.Count, false));
+            }
+        }
+
         public static unsafe NSData CreateWithBytes(byte[] bytes)
         {
             fixed (byte* ptr = bytes)

@@ -15,6 +15,8 @@ using Unity.Collections.LowLevel.Unsafe;
 //    sessions, or relays, or trees, or...?)
 // 5. stop advertising when connection limit reached
 
+// FIXME: avoid Guid/String conversions
+
 namespace Netcode.Transports.MultipeerConnectivity
 {
     public class MultipeerConnectivityTransport : LocalP2PTransport
@@ -34,11 +36,28 @@ namespace Netcode.Transports.MultipeerConnectivity
         [Tooltip("The display name of the local user.")]
         public string UserDisplayName;
 
+        /// <summary>
+        /// An override for the maximum number of peers this transport should
+        /// accept, not including itself; zero means use the transport's maximum.
+        /// The actual used value will never be higher than the transport's actual
+        /// limit, regardless of this value.
+        /// </summary>
+        [SerializeField]
+        [Tooltip("An override for the maximum number of peers this transport should accept, not including itself; zero means use the transport's maximum")]
+        public int OverridePeerLimit = 0;
+
         public override bool Advertising { get => m_MCSession.advertising; protected set => m_MCSession.advertising = value; }
 
         public override bool Discovering { get => m_MCSession.browsing; protected set => m_MCSession.browsing = value; }
 
-        protected override int PeerLimit => (int)(m_MCSession.maximumNumberOfPeers - 1);
+        protected override int PeerLimit
+        {
+            get
+            {
+                int transportLimit = (int)(m_MCSession.maximumNumberOfPeers - 1);
+                return (OverridePeerLimit > 0 && OverridePeerLimit < transportLimit) ? OverridePeerLimit : transportLimit;
+            }
+        }
 
         private MCSession m_MCSession;
         private bool m_Inited;
@@ -128,32 +147,19 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         #region NetworkTransport Overrides
 
-        public override ulong ServerClientId => 0;
-
         public override bool IsSupported => Application.platform == RuntimePlatform.IPhonePlayer
                 || Application.platform == RuntimePlatform.OSXPlayer
                 || Application.platform == RuntimePlatform.tvOS;
 
         public override void DisconnectLocalClient()
         {
-            m_MCSession.Disconnect();
+            if (m_SuspendDisconnectingClients)
+                return;
 
             if (LogLevel <= LogLevel.Developer)
                 Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnecting local client.");
-        }
 
-        public override void DisconnectRemoteClient(ulong clientId)
-        {
-            if (m_ConnectedPeers.TryGetValue(clientId, out Guid peerID))
-            {
-                SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
-                m_ConnectedPeers.Remove(clientId);
-
-                if (LogLevel <= LogLevel.Developer)
-                    Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnecting remote client with ID {clientId}.");
-            }
-            else if (LogLevel <= LogLevel.Normal)
-                Debug.LogWarning($"[{nameof(MultipeerConnectivityTransport)}] - Failed to disconnect remote client with ID {clientId}, client not connected.");
+            m_MCSession.Disconnect();
         }
 
         public override unsafe ulong GetCurrentRtt(ulong clientId)
@@ -166,7 +172,7 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         }
 
-        private MCSessionSendDataMode NetworkDeliveryToSendType(NetworkDelivery delivery)
+        private MCSessionSendDataMode NetworkDeliveryToSendDataMode(NetworkDelivery delivery)
         {
             return delivery switch
             {
@@ -195,24 +201,13 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public override void Send(ulong clientId, ArraySegment<byte> data, NetworkDelivery delivery)
+        protected override void SendToPeer(Guid peerID, ArraySegment<byte> data, NetworkDelivery delivery)
         {
-            // var sendType = NetworkDeliveryToSendType(delivery);
-
-            // if (clientId == ServerClientId)
-            //     connectionManager.Connection.SendMessage(data.Array, data.Offset, data.Count, sendType);
-            // else if (m_ConnectedPeers.TryGetValue(clientId, out Client user))
-            //     user.connection.SendMessage(data.Array, data.Offset, data.Count, sendType);
-            // else if (LogLevel <= LogLevel.Normal)
-            //     Debug.LogWarning($"[{nameof(MultipeerConnectivityTransport)}] - Failed to send packet to remote client with ID {clientId}, client not connected.");
-        }
-
-        public override NetworkEvent PollEvent(out ulong clientId, out ArraySegment<byte> payload, out float receiveTime)
-        {
-            clientId = 0;
-            receiveTime = Time.realtimeSinceStartup;
-            payload = default;
-            return NetworkEvent.Nothing;
+            var sendMode = NetworkDeliveryToSendDataMode(delivery);
+            using (var nsData = NSData.CreateWithBytesNoCopy(data))
+            {
+                m_MCSession.SendToPeer(peerID.ToString(), nsData, sendMode);
+            }
         }
 
         public override bool StartClient()
@@ -249,16 +244,14 @@ namespace Netcode.Transports.MultipeerConnectivity
             m_MCSession.Dispose();
         }
 
-        public override void AcceptPeer(PeerInfo peer)
+        protected override void AcceptPeer(PeerInfo peer)
         {
-// TODO:
-            throw new NotImplementedException();
+            m_MCSession.InviteDiscoveredPeer(peer.PeerID.ToString());
         }
 
-        public override void RejectPeer(PeerInfo peer)
+        protected override void RejectPeer(PeerInfo peer)
         {
-// TODO:
-            throw new NotImplementedException();
+            m_MCSession.RejectDiscoveredPeer(peer.PeerID.ToString());
         }
 
         #endregion
