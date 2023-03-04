@@ -4,7 +4,7 @@ namespace Netcode.LocalPeerToPeer
 {
     public enum PeerMode : byte
     {
-        Undetermined,
+        PeerToPeer,
         Server,
         Client,
     }

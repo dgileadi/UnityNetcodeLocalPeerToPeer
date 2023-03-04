@@ -6,6 +6,19 @@ using UnityEngine;
 using Unity.Collections;
 using Unity.Netcode;
 
+// TODO: things this class might do:
+// - work with LocalP2PNetworkManagerExtensions to start/stop p2p sessions
+//   before/after NetworkManager
+// - provide hooks for picking a server, whether to connect, what to do
+//   after a disconnect, etc.
+// - heartbeat
+// - relay
+
+// algorithm for picking a server: https://paulbellamy.com/2017/02/a-distributed-trustless-coin-flip-algorithm
+// - along with advertising, send a user ID and guess hash
+// - once connected, each peer sends the other their actual guess
+// - the winner becomes the server
+
 // TODO: maybe heartbeat/disconnect support, assuming the underlying transport
 // doesn't do it for us
 
@@ -27,12 +40,18 @@ namespace Netcode.LocalPeerToPeer
         /// </summary>
         public Guid PeerID { get; set; } = Guid.NewGuid();
 
-        public PeerMode StartMode { get; set; } = PeerMode.Undetermined;
+        /// <summary>
+        /// The mode this transport was started in. If started in Server or Client
+        /// mode then this transport must remain in that mode until networking is
+        /// stopped. If started in PeerToPeer mode then this transport may become
+        /// a server or a client at different points of its lifetime.
+        /// </summary>
+        public PeerMode StartMode { get; protected set; } = PeerMode.PeerToPeer;
 
-        public PeerMode Mode => NetworkManager.Singleton.IsServer ? PeerMode.Server : NetworkManager.Singleton.IsClient ? PeerMode.Client : PeerMode.Undetermined;
-
-        // FIXME: use this? relying on m_ConnectedPeers.Count is wrong, since server goes there too
-        public bool ShouldBeServer => StartMode == PeerMode.Server || m_ConnectedPeers.Count > 0;
+        /// <summary>
+        /// The mode this transport is currently running in.
+        /// </summary>
+        public PeerMode Mode => NetworkManager.Singleton.IsServer ? PeerMode.Server : NetworkManager.Singleton.IsClient ? PeerMode.Client : PeerMode.PeerToPeer;
 
         /// <summary>
         /// Whether this transport is advertising its presence to other local peers.
@@ -51,18 +70,69 @@ namespace Netcode.LocalPeerToPeer
         /// </summary>
         protected abstract int PeerLimit { get; }
 
+        /// <summary>
+        /// A component that decides whether two peers should connect. A default
+        /// adjudicator is created at runtime if one is not provided.
+        /// </summary>
+        [SerializeField]
         public ConnectionAdjudicator ConnectionAdjudicator;
 
+        /// <summary>
+        /// The number of peers this transport knows about.
+        /// </summary>
         public int KnownPeerCount => m_MessageRecipients.Count;
-        public int DirectlyConnectedPeerCount => m_MessageRecipients.Count(entry => entry.Key == entry.Value);
+
+        /// <summary>
+        /// The number of peers this transport is directly connected to (i.e. not
+        /// through any relay).
+        /// </summary>
+        public abstract int DirectlyConnectedPeerCount { get; }
 
         public override ulong ServerClientId => m_ConnectedPeersByIDs.GetValueOrDefault(m_ServerPeerID, 0ul);
 
+        /// <summary>
+        /// Whether this transport has been started.
+        /// </summary>
         public bool Started { get; protected set; }
+
+        /// <summary>
+        /// Whether this transport has a server.
+        /// </summary>
         public bool HasServer => m_ServerPeerID != default && m_ServerPeerID != PeerID;
+
+        /// <summary>
+        /// Whether this transport is indirectly connected to the server through
+        /// a relay peer.
+        /// </summary>
         public bool IsRelayed => m_RelayPeerID != default;
+
+        /// <summary>
+        /// Whether this transport is a relay between a server and other peers.
+        /// </summary>
         public bool IsRelayer => Mode != PeerMode.Server && (Advertising || m_ConnectedPeers.Count > 1);
 
+        /// <summary>
+        /// The ID of the relay peer if this peer has one, or else the ID of the
+        /// server peer if directly connected, or else <c>default</c> if this
+        /// peer isn't connected to any other peer.
+        /// </summary>
+        public Guid RelayOrServerPeerID => m_RelayPeerID == default ? m_ServerPeerID : m_RelayPeerID;
+
+        /// <summary>
+        /// The ID of this transport's server, or <c>default</c> if it has no
+        /// server. If this transport is a host it is this transport's own
+        /// <c>PeerID</c>.
+        /// </summary>
+        public Guid ServerPeerID => m_ServerPeerID;
+
+        /// <summary>
+        /// The ID of this transport's relay peer, or <c>default</c> if it has no
+        /// relay peer.
+        /// </summary>
+        public Guid RelayPeerID => m_RelayPeerID;
+
+// TODO: document these:
+        protected bool m_Inited;
         protected Dictionary<ulong, Guid> m_ConnectedPeers = new Dictionary<ulong, Guid>();
         protected Dictionary<Guid, ulong> m_ConnectedPeersByIDs = new Dictionary<Guid, ulong>();
         protected Dictionary<Guid, Guid> m_MessageRecipients = new Dictionary<Guid, Guid>();
@@ -73,6 +143,12 @@ namespace Netcode.LocalPeerToPeer
         protected bool m_SuspendDisconnectingClients;
         protected Coroutine m_ChangeModeCoroutine;
         internal protected LogLevel LogLevel => NetworkManager.Singleton.LogLevel;
+
+        public override void Initialize(NetworkManager networkManager = null)
+        {
+            if (!m_Inited)
+                m_Inited = true;
+        }
 
         /// <summary>
         /// Starts peer advertising and discovering. Must be started before
@@ -88,16 +164,25 @@ namespace Netcode.LocalPeerToPeer
                 return true;
             }
 
-            return StartWithMode(PeerMode.Undetermined);
+            if (LogLevel <= LogLevel.Developer)
+                Debug.Log($"[{this.GetType().Name}] - Starting in peer-to-peer mode.");
+
+            return StartWithMode(PeerMode.PeerToPeer);
         }
 
         public override bool StartServer()
         {
+            if (LogLevel <= LogLevel.Developer)
+                Debug.Log($"[{this.GetType().Name}] - Starting as server.");
+
             return StartWithMode(PeerMode.Server);
         }
 
         public override bool StartClient()
         {
+            if (LogLevel <= LogLevel.Developer)
+                Debug.Log($"[{this.GetType().Name}] - Starting as client.");
+
             return StartWithMode(PeerMode.Client);
         }
 
@@ -105,6 +190,12 @@ namespace Netcode.LocalPeerToPeer
         {
             if (Started)
                 return true;
+
+            if (!m_Inited)
+            {
+                Initialize(NetworkManager.Singleton);
+                m_Inited = true;
+            }
 
             if (ConnectionAdjudicator == null)
                 ConnectionAdjudicator = FindObjectOfType<ConnectionAdjudicator>(true);
@@ -124,7 +215,7 @@ namespace Netcode.LocalPeerToPeer
             else if (mode == PeerMode.Client)
                 RunAsClient();
             else
-                RunAsUndetermined();
+                RunAsPeerToPeer();
 
             Started = true;
             return true;
@@ -151,6 +242,8 @@ namespace Netcode.LocalPeerToPeer
             {
                 SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
                 m_ConnectedPeers.Remove(clientId);
+                m_ConnectedPeersByIDs.Remove(peerID);
+                m_MessageRecipients.Remove(peerID);
 
                 if (LogLevel <= LogLevel.Developer)
                     Debug.Log($"[{this.GetType().Name}] - Disconnecting remote client with ID {clientId}.");
@@ -159,11 +252,11 @@ namespace Netcode.LocalPeerToPeer
                 Debug.LogWarning($"[{this.GetType().Name}] - Failed to disconnect remote client with ID {clientId}, client not connected.");
         }
 
-        protected virtual void RunAsUndetermined()
+        protected virtual void RunAsPeerToPeer()
         {
-            if (!ShouldChangeModeTo(PeerMode.Undetermined))
+            if (!ShouldChangeModeTo(PeerMode.PeerToPeer))
                 return;
-            m_ChangeModeCoroutine = StartCoroutine(DoRunAsUndetermined());
+            m_ChangeModeCoroutine = StartCoroutine(DoRunAsPeerToPeer());
         }
 
         protected virtual void RunAsServer()
@@ -182,7 +275,7 @@ namespace Netcode.LocalPeerToPeer
 
         protected virtual bool ShouldChangeModeTo(PeerMode mode)
         {
-            if (mode == this.Mode)
+            if (this.Mode == mode)
                 return false;
             if (m_ChangeModeCoroutine != null)
             {
@@ -190,16 +283,16 @@ namespace Netcode.LocalPeerToPeer
                     Debug.LogError($"[{this.GetType().Name}] - Unable to switch to {mode} mode because a mode change is already in progress.");
                 return false;
             }
-            if (mode != StartMode && StartMode != PeerMode.Undetermined)
+            if (mode != StartMode && StartMode != PeerMode.PeerToPeer)
             {
                 if (LogLevel <= LogLevel.Error)
-                    Debug.LogError($"[{this.GetType().Name}] - Unable to switch back to {mode} mode because was started in {StartMode} mode.");
+                    Debug.LogError($"[{this.GetType().Name}] - Unable to switch to {mode} mode because was started in {StartMode} mode.");
                 return false;
             }
             return true;
         }
 
-        protected virtual IEnumerator DoRunAsUndetermined()
+        protected virtual IEnumerator DoRunAsPeerToPeer()
         {
             if (NetworkManager.Singleton.IsListening)
                 yield return ShutdownNetworkManager(disconnectClients: true);
@@ -220,8 +313,8 @@ namespace Netcode.LocalPeerToPeer
                     continue;
                 InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
             }
-            Advertising = true;
-            Discovering = false; // TODO: true in some/all cases?
+            Advertising = DirectlyConnectedPeerCount < PeerLimit;
+            Discovering = true; // servers need to discover other servers
         }
 
         protected virtual IEnumerator DoRunAsClient()
@@ -237,8 +330,8 @@ namespace Netcode.LocalPeerToPeer
                 SendRelayPeerConnected(peerID);
                 SendServerChanged(peerID);
             }
+            Advertising = IsRelayer && DirectlyConnectedPeerCount < PeerLimit;
             Discovering = !HasServer;
-            Advertising = IsRelayer;
         }
 
         protected IEnumerator ShutdownNetworkManager(bool disconnectClients = false)
@@ -275,14 +368,6 @@ namespace Netcode.LocalPeerToPeer
             return m_MessageRecipients.ContainsKey(peerID);
         }
 
-        protected bool IsRelayedClient(Guid peerID)
-        {
-            Guid relayPeerID;
-            if (m_MessageRecipients.TryGetValue(peerID, out relayPeerID))
-                return relayPeerID != peerID;
-            return false;
-        }
-
         protected abstract void AcceptPeer(PeerInfo peer);
 
         protected abstract void RejectPeer(PeerInfo peer);
@@ -301,9 +386,11 @@ namespace Netcode.LocalPeerToPeer
                 return;
             }
 
-            SendToPeer(peerID, data, delivery);
-
-            // TODO: handle relay here?
+            var throughPeerID = m_MessageRecipients[peerID];
+            if (throughPeerID == peerID)
+                SendToPeer(peerID, data, delivery);
+            else
+                SendRelayMessage(peerID, throughPeerID, data, delivery);
         }
 
         public override NetworkEvent PollEvent(out ulong clientId, out ArraySegment<byte> payload, out float receiveTime)
@@ -314,17 +401,15 @@ namespace Netcode.LocalPeerToPeer
             return NetworkEvent.Nothing;
         }
 
-        protected virtual void PeerConnected(PeerInfo peer, Guid throughPeerID)
+        protected virtual void PeerConnected(PeerInfo peer)
         {
-// TODO: should we avoid generating a client ID until we know who the server is?
-            var clientId = GenerateClientId(peer);
+            var clientId = GenerateClientId(peer.PeerID);
             m_ConnectedPeers.Add(clientId, peer.PeerID);
             m_ConnectedPeersByIDs.Add(peer.PeerID, clientId);
-            m_MessageRecipients.Add(peer.PeerID, throughPeerID);
+            m_MessageRecipients.Add(peer.PeerID, peer.PeerID);
 
-            if (StartMode == peer.StartMode && StartMode != PeerMode.Undetermined)
+            if (StartMode == peer.StartMode && StartMode != PeerMode.PeerToPeer)
             {
-                // this should never happen
                 if (LogLevel <= LogLevel.Error)
                     Debug.LogError($"[{this.GetType().Name}] - This transport and {peer.PeerID} both started in {StartMode} mode and shouldn't have connected.");
                 DisconnectRemoteClient(clientId);
@@ -334,7 +419,10 @@ namespace Netcode.LocalPeerToPeer
             StartCoroutine(ConnectionAdjudicator.PickServer(peer, (success, pickedPeerID, serverPeerID, mode) =>
             {
                 if (!success)
+                {
+                    DisconnectRemoteClient(m_ConnectedPeersByIDs[peer.PeerID]);
                     return;
+                }
 
                 this.m_ServerPeerID = serverPeerID;
                 if (mode == PeerMode.Server)
@@ -354,7 +442,7 @@ namespace Netcode.LocalPeerToPeer
             if (IsTransportLevelMessage(payload))
             {
                 var type = (TransportLevelMessageType)payload[3];
-                HandleTransportLevelMessage(fromPeerID, type, payload.Slice(4));
+                HandleTransportLevelMessage(fromPeerID, type, payload);
             }
             else if (m_ConnectedPeersByIDs.ContainsKey(fromPeerID))
                 InvokeOnTransportEvent(NetworkEvent.Data, m_ConnectedPeersByIDs[fromPeerID], payload, Time.realtimeSinceStartup);
@@ -372,8 +460,7 @@ namespace Netcode.LocalPeerToPeer
 
         protected virtual void LostConnectionToClient(PeerInfo peer)
         {
-            ulong clientId;
-            if (!m_ConnectedPeersByIDs.TryGetValue(peer.PeerID, out clientId))
+            if (!m_ConnectedPeersByIDs.TryGetValue(peer.PeerID, out ulong clientId))
             {
                 if (LogLevel <= LogLevel.Error)
                     Debug.LogError($"[{this.GetType().Name}] - Peer {peer.DisplayName} with ID {peer.PeerID} disconnected, but they weren't a client.");
@@ -418,20 +505,34 @@ namespace Netcode.LocalPeerToPeer
             */
         }
 
-        protected virtual ulong GenerateClientId(PeerInfo peer)
+        protected virtual ulong GenerateClientId(Guid peerID)
         {
             return ++m_NextClientId;
         }
 
+        # region Transport-Level Messages
+
         protected virtual void SendRelayPeerConnected(Guid peerID)
         {
-            var toPeerID = m_RelayPeerID == default ? m_ServerPeerID : m_RelayPeerID;
-            SendTransportLevelMessage(toPeerID, TransportLevelMessageType.RelayPeerConnected, new RelayPeerIDPayload(peerID), NetworkDelivery.Reliable);
+            SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, new RelayPeerIDPayload(peerID), NetworkDelivery.Reliable);
         }
 
         protected virtual void SendServerChanged(Guid peerID)
         {
             SendTransportLevelMessage(peerID, TransportLevelMessageType.RelayServerChanged, new RelayPeerIDPayload(m_ServerPeerID), NetworkDelivery.Reliable);
+        }
+
+        protected virtual void SendRelayMessage(Guid toPeerID, Guid throughPeerID, ArraySegment<byte> message, NetworkDelivery delivery)
+        {
+            var relayHeader = new RelayMessage(toPeerID, delivery);
+
+            using var writer = new FastBufferWriter(4 + FastBufferWriter.GetWriteSize<RelayMessage>() + message.Count, Allocator.Temp);
+            writer.WriteBytes(TransportLevelMessageHeader);
+            writer.WriteByte((byte)TransportLevelMessageType.RelayMessage);
+            writer.WriteValue(relayHeader);
+            writer.WriteBytes(message.Array, message.Count, message.Offset);
+
+            SendTransportLevelMessage(throughPeerID, TransportLevelMessageType.RelayMessage, writer.ToArray(), delivery);
         }
 
         /// <summary>
@@ -541,37 +642,70 @@ namespace Netcode.LocalPeerToPeer
             var pendingMessage = m_PendingTransportLevelMessages.FirstOrDefault(message => message.Matches(fromPeerID, type));
             if (pendingMessage.Matches(fromPeerID, type))
             {
-                pendingMessage.Message = payload;
+                pendingMessage.Message = payload.Slice(4);
                 return;
             }
 
-            // TODO:
             switch (type)
             {
                 case TransportLevelMessageType.DisconnectCommand:
                     DisconnectLocalClient();
                     break;
+
                 case TransportLevelMessageType.RelayPeerConnected:
-                    // TODO:
+                    HandleRelayPeerConnected(fromPeerID, payload.Slice(4));
                     break;
+
+                case TransportLevelMessageType.RelayServerChanged:
+                    HandleRelayServerChanged(fromPeerID, payload.Slice(4));
+                    break;
+
                 case TransportLevelMessageType.RelayPeerDisconnected:
                     // TODO:
+                    break;
+
+                case TransportLevelMessageType.RelayMessage:
+                    HandleRelayMessage(fromPeerID, payload);
                     break;
             }
         }
 
-        // TODO: things this class might do:
-        // - work with LocalP2PNetworkManagerExtensions to start/stop p2p sessions
-        //   before/after NetworkManager
-        // - provide hooks for picking a server, whether to connect, what to do
-        //   after a disconnect, etc.
-        // - heartbeat
-        // - relay
+        protected virtual void HandleRelayPeerConnected(Guid fromPeerID, ArraySegment<byte> payload)
+        {
+            var peerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
 
-        // algorithm for picking a server: https://paulbellamy.com/2017/02/a-distributed-trustless-coin-flip-algorithm
-        // - along with advertising, send a user ID and guess hash
-        // - once connected, each peer sends the other their actual guess
-        // - the winner becomes the server
+            var clientId = GenerateClientId(peerID);
+            m_ConnectedPeers.Add(clientId, peerID);
+            m_ConnectedPeersByIDs.Add(peerID, clientId);
+            m_MessageRecipients.Add(peerID, fromPeerID);
+
+            if (NetworkManager.Singleton.IsServer)
+                InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
+            else
+                SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, payload, NetworkDelivery.Reliable);
+        }
+
+        protected virtual void HandleRelayServerChanged(Guid fromPeerID, ArraySegment<byte> payload)
+        {
+            m_ServerPeerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
+            m_MessageRecipients[m_ServerPeerID] = fromPeerID;
+        }
+
+        protected virtual void HandleRelayMessage(Guid fromPeerID, ArraySegment<byte> payload)
+        {
+            var relayMessage = ReadValue<RelayMessage>(payload.Slice(4));
+            if (!m_MessageRecipients.TryGetValue(relayMessage.ToPeerID, out Guid throughPeerID))
+            {
+                if (LogLevel <= LogLevel.Error)
+                    Debug.LogError($"[{this.GetType().Name}] - Asked to relay to unknown peer {relayMessage.ToPeerID}.");
+                return;
+            }
+
+            if (relayMessage.ToPeerID == throughPeerID)
+                SendToPeer(relayMessage.ToPeerID, payload.Slice(4), relayMessage.Delivery);
+            else
+                SendTransportLevelMessage(throughPeerID, TransportLevelMessageType.RelayMessage, payload, relayMessage.Delivery);
+        }
 
 
         protected struct PendingTransportLevelMessage
@@ -609,6 +743,21 @@ namespace Netcode.LocalPeerToPeer
             }
         }
 
+
+        protected struct RelayMessage : INetworkSerializeByMemcpy
+        {
+            public Guid ToPeerID { get; set; }
+            public NetworkDelivery Delivery { get; set; }
+
+            public RelayMessage(Guid toPeerID, NetworkDelivery delivery)
+            {
+                this.ToPeerID = toPeerID;
+                this.Delivery = delivery;
+            }
+        }
+
+        #endregion
+
     }
 
 
@@ -619,6 +768,7 @@ namespace Netcode.LocalPeerToPeer
         RelayPeerConnected,
         RelayPeerDisconnected,
         RelayServerChanged,
+        RelayMessage,
     }
 
 }

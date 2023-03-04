@@ -26,7 +26,7 @@ namespace Netcode.LocalPeerToPeer
         /// The PeerID of the peer's server or <c>default(Guid)</c> if the peer
         /// doesn't have a server
         /// </summary>
-        public Guid ServerID { get; }
+        public Guid ServerPeerID { get; }
     }
 
 
@@ -86,14 +86,15 @@ namespace Netcode.LocalPeerToPeer
         /// <c>true</c> to accept or <c>false</c> to reject the connection.</param>
         public virtual void HandlePeerDiscovered(PeerInfo peer, AcceptConnectionCallback callback)
         {
-            callback(Transport.StartMode != peer.StartMode || Transport.StartMode == PeerMode.Undetermined);
+            callback(Transport.StartMode != peer.StartMode || Transport.StartMode == PeerMode.PeerToPeer);
         }
 
         /// <summary>
         /// Decide whether to connect to the given peer when this local transport
-        /// is a server and the connecting peer is also a server. In this case one
-        /// of the peers will need to give up being a server and connect to the
-        /// other peer as a client or relay.
+        /// has a server and the connecting peer also has a server. In this case
+        /// one of the peers will need to give up being a server and connect to
+        /// the other peer as a client or relay. This method is called by
+        /// <see cref="PickServer"/>.
         /// <para>
         /// The default behavior always immediately calls the callback with
         /// <c>true</c> to accept the connection.
@@ -102,7 +103,8 @@ namespace Netcode.LocalPeerToPeer
         /// Note that this method is only called for peers that were started in
         /// using <see cref="LocalP2PNetworkManagerExtensions.StartPeerToPeer"/>.
         /// Peers that were started using <see cref="NetworkManager.StartServer"/>
-        /// always remain servers, and two of them cannot connect to each other.
+        /// always remain servers, and the behavior of <see cref="HandlePeerDiscovered"/>
+        /// prevents two of them from connecting to each other.
         /// </para>
         /// </summary>
         /// <param name="peer">The connecting server peer.</param>
@@ -145,7 +147,7 @@ namespace Netcode.LocalPeerToPeer
             if (peerStartBytes == null)
             {
                 if (Transport.LogLevel <= LogLevel.Error)
-                    Debug.LogError($"[{this.GetType().Name}] - Didn't receive valid server negotiation message from {peer.PeerID} within {receivedMessageDuration} seconds.");
+                    Debug.LogError($"[{Transport.GetType().Name}] - Didn't receive valid server negotiation message from {peer.PeerID} within {receivedMessageDuration} seconds.");
                 callback(false, default, default, default);
                 yield break;
             }
@@ -166,8 +168,8 @@ namespace Netcode.LocalPeerToPeer
                 yield break;
             }
 
-            // both peers are servers
-            if (myPayload.Mode == PeerMode.Server && theirPayload.Mode == PeerMode.Server)
+            // both peers already have servers
+            if (HasServer(myPayload) && HasServer(theirPayload))
             {
                 bool? shouldConnectTwoServers = null;
                 HandleTwoServersConnecting(peer, accept => shouldConnectTwoServers = accept);
@@ -182,17 +184,43 @@ namespace Netcode.LocalPeerToPeer
             }
 
             Guid pickedPeerID;
-
-            // if one peer has more known peers, pick that one
-            if (!PickServerFromClientCounts(peer, myPayload.PeerCount, theirPayload.PeerCount, out pickedPeerID))
-                // otherwise use each guess to pick a server
-                pickedPeerID = PickServerFromGuesses(peer, myPayload.Guess, theirPayload.Guess);
+            if (PickServerPeer(peer, myPayload, theirPayload, out pickedPeerID) != PickResult.Picked)
+            {
+                if (Transport.LogLevel <= LogLevel.Developer)
+                    Debug.Log($"[{Transport.GetType().Name}] - Couldn't pick a server; aborting.");
+                callback(false, default, default, default);
+                yield break;
+            }
 
             var serverPayload = pickedPeerID == Transport.PeerID ? myPayload : theirPayload;
             var mode = DetectPeerMode(pickedPeerID, serverPayload, peer);
-            var serverPeerID = mode == PeerMode.Server ? pickedPeerID : serverPayload.ServerID;
+            var serverPeerID = mode == PeerMode.Server ? pickedPeerID : serverPayload.ServerPeerID;
+
+            // if attempting to switch to a disallowed mode, abort
+            var serverStartMode = pickedPeerID == Transport.PeerID ? Transport.StartMode : peer.StartMode;
+            var clientStartMode = pickedPeerID == Transport.PeerID ? peer.StartMode : Transport.StartMode;
+            if (clientStartMode == PeerMode.Server || (mode != serverStartMode && serverStartMode != PeerMode.PeerToPeer))
+            {
+                if (Transport.LogLevel <= LogLevel.Normal)
+                {
+                    if (clientStartMode == PeerMode.Server)
+                    {
+                        var clientPeerID = pickedPeerID == Transport.PeerID ? peer.PeerID : Transport.PeerID;
+                        Debug.Log($"[{Transport.GetType().Name}] - Attempt to change peer {clientPeerID} to client mode from start mode {clientStartMode}; aborting.");
+                    }
+                    else
+                        Debug.Log($"[{Transport.GetType().Name}] - Attempt to change peer {pickedPeerID} to mode {mode} from start mode {serverStartMode}; aborting.");
+                }
+                callback(false, default, default, default);
+                yield break;
+            }
 
             callback(true, pickedPeerID, serverPeerID, mode);
+        }
+
+        protected virtual bool HasServer(NegotiateServerMessage payload)
+        {
+            return payload.Mode == PeerMode.Server || payload.ServerPeerID != default;
         }
 
         /// <summary>
@@ -211,6 +239,7 @@ namespace Netcode.LocalPeerToPeer
             message.Mode = Transport.Mode;
             message.PeerCount = (byte)Transport.KnownPeerCount;
             message.Guess = (byte)guess;
+            message.ServerPeerID = Transport.ServerPeerID;
 
             Transport.SendTransportLevelMessage<DefaultNegotiateServerMessage>(peer.PeerID, TransportLevelMessageType.NegotiateServer, (DefaultNegotiateServerMessage)message, NetworkDelivery.Reliable);
 
@@ -231,20 +260,78 @@ namespace Netcode.LocalPeerToPeer
             return Transport.ReadValue<DefaultNegotiateServerMessage>(bytes);
         }
 
-        protected bool PickServerFromClientCounts(PeerInfo peer, int myPeerCount, int theirPeerCount, out Guid serverPeerID)
+        /// <summary>
+        /// Pick a server/relay peer ID from the negotiation messages.
+        /// </summary>
+        /// <param name="peer">The other peer</param>
+        /// <param name="myPayload">This transport's negotiation message</param>
+        /// <param name="theirPayload">The other peer's negotiation message</param>
+        /// <param name="pickedPeerID">The chosen peer ID, if one was picked</param>
+        /// <returns>The result of picking a server</returns>
+        protected virtual PickResult PickServerPeer(PeerInfo peer, NegotiateServerMessage myPayload, NegotiateServerMessage theirPayload, out Guid pickedPeerID)
+        {
+            pickedPeerID = default;
+
+            // if a server is connecting to a relay, pick the relay
+            var result = PickServerConnectingToRelay(Transport.PeerID, Transport.Mode, peer.PeerID, theirPayload.ServerPeerID, out pickedPeerID);
+            if (result != PickResult.TryAgain)
+                return result;
+            result = PickServerConnectingToRelay(peer.PeerID, theirPayload.Mode, Transport.PeerID, Transport.ServerPeerID, out pickedPeerID);
+            if (result != PickResult.TryAgain)
+                return result;
+
+            // if one peer has more known peers, pick that one
+            result = PickServerFromClientCounts(peer, myPayload.PeerCount, theirPayload.PeerCount, out pickedPeerID);
+            if (result != PickResult.TryAgain)
+                return result;
+
+            // otherwise use each guess to pick a server
+            pickedPeerID = PickServerFromGuesses(peer, myPayload.Guess, theirPayload.Guess);
+            return PickResult.Picked;
+        }
+
+        /// <summary>
+        /// If one peer is a server and the other peer has a server but isn't
+        /// one itself, make this server connect to the other peer (and give up
+        /// being a server).
+        /// </summary>
+        /// <param name="myPeerID">The ID of the comparing peer</param>
+        /// <param name="myMode">The current mode of the comparing peer</param>
+        /// <param name="theirPeerID">The ID of the other peer</param>
+        /// <param name="theirServerID">The server ID of the other peer</param>
+        /// <param name="pickedPeerID">The chosen peer ID, if one was picked</param>
+        /// <returns>The result of picking a server</returns>
+        protected PickResult PickServerConnectingToRelay(Guid myPeerID, PeerMode myMode, Guid theirPeerID, Guid theirServerID, out Guid pickedPeerID)
+        {
+            pickedPeerID = default;
+            if (myMode == PeerMode.Server && theirServerID != default && theirServerID != theirPeerID)
+            {
+                // if two servers connect to each other's relays, then we could
+                // get a situation with no server at all. To prevent that, we
+                // only allow one server to connect
+                if (theirServerID.CompareTo(myPeerID) < 0)
+                    return PickResult.AbortConnection;
+
+                pickedPeerID = theirPeerID;
+                return PickResult.Picked;
+            }
+            return PickResult.TryAgain;
+        }
+
+        protected PickResult PickServerFromClientCounts(PeerInfo peer, int myPeerCount, int theirPeerCount, out Guid serverPeerID)
         {
             if (myPeerCount > theirPeerCount)
             {
                 serverPeerID = Transport.PeerID;
-                return true;
+                return PickResult.Picked;
             }
             if (myPeerCount < theirPeerCount)
             {
                 serverPeerID = peer.PeerID;
-                return true;
+                return PickResult.Picked;
             }
             serverPeerID = default;
-            return false;
+            return PickResult.TryAgain;
         }
 
         protected Guid PickServerFromGuesses(PeerInfo peer, int myGuess, int theirGuess)
@@ -267,8 +354,9 @@ namespace Netcode.LocalPeerToPeer
 
         protected PeerMode DetectPeerMode(Guid serverPeerID, NegotiateServerMessage serverPayload, PeerInfo peer)
         {
-            if (serverPayload.ServerID != default && serverPayload.ServerID != peer.PeerID)
-                return serverPayload.Mode == PeerMode.Undetermined ? PeerMode.Client : serverPayload.Mode;
+// FIXME: figure out all cases, document
+            if (serverPayload.ServerPeerID != default && serverPayload.ServerPeerID != peer.PeerID)
+                return serverPayload.Mode == PeerMode.PeerToPeer ? PeerMode.Client : serverPayload.Mode;
             return PeerMode.Server;
         }
 
@@ -279,7 +367,14 @@ namespace Netcode.LocalPeerToPeer
             private byte m_Mode;
             public byte PeerCount { get; set; }
             public byte Guess { get; set; }
-            public Guid ServerID { get; set; }
+            public Guid ServerPeerID { get; set; }
+        }
+
+        protected enum PickResult
+        {
+            Picked,
+            TryAgain,
+            AbortConnection,
         }
     }
 

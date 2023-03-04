@@ -60,7 +60,6 @@ namespace Netcode.Transports.MultipeerConnectivity
         }
 
         private MCSession m_MCSession;
-        private bool m_Inited;
 
         #region MonoBehaviour Messages
 
@@ -69,15 +68,11 @@ namespace Netcode.Transports.MultipeerConnectivity
             Initialize();
         }
 
-        // void OnEnable()
-        // {
-        //     m_MCSession.enabled = true;
-        // }
-
-        // void OnDisable()
-        // {
-        //     m_MCSession.enabled = false;
-        // }
+        private void OnDestroy()
+        {
+            ShutdownPeerToPeer();
+            m_MCSession.Dispose();
+        }
 
         private void Update()
         {
@@ -93,7 +88,7 @@ namespace Netcode.Transports.MultipeerConnectivity
             {
                 using (var peerInfo = m_MCSession.DequeueConnectedPeer())
                 {
-                    PeerConnected(peerInfo, peerInfo.PeerID);
+                    PeerConnected(peerInfo);
                 }
             }
 
@@ -105,7 +100,6 @@ namespace Netcode.Transports.MultipeerConnectivity
                 }
             }
 
-// TODO:
             // check for errors encountered
             while (m_MCSession.errorCount > 0)
             {
@@ -113,34 +107,18 @@ namespace Netcode.Transports.MultipeerConnectivity
                 {
                     Debug.LogError("Error " + error.Code + " from Multipeer Connectivity: " + error.Description);
                     // TODO: maybe base the status on error codes instead
-                    // status = CollaborativeSessionStatus.prevented;
                 }
             }
 
             // check for incoming data
             while (m_MCSession.receivedDataQueueSize > 0)
             {
-                // status = CollaborativeSessionStatus.running;
                 using (var peerMessage = m_MCSession.DequeueReceivedData())
                 {
                     var peerID = peerMessage.peerID;
-
-// TODO: handle relay messages
-
-// TODO: handle peer-connected notifications from relay peers
-
-                    // var peer = m_ConnectedPeers.FirstOrDefault(peer => peer.id == peerID);
-                    // if (peer == null)
-                    //     return;
-
-                    // callback.ReceivedPeerMessage(new PeerMessage(peer, peerMessage.data.NativeArrayNoCopy), processImmediately: true);
+                    ReceivedPeerMessage(new Guid(peerMessage.peerID), new ArraySegment<byte>(peerMessage.data.NativeArrayNoCopy.ToArray()));
                 }
             }
-        }
-
-        private void OnDestroy()
-        {
-            ShutdownPeerToPeer();
         }
 
         #endregion
@@ -150,6 +128,8 @@ namespace Netcode.Transports.MultipeerConnectivity
         public override bool IsSupported => Application.platform == RuntimePlatform.IPhonePlayer
                 || Application.platform == RuntimePlatform.OSXPlayer
                 || Application.platform == RuntimePlatform.tvOS;
+
+        public override int DirectlyConnectedPeerCount => m_MCSession.connectedPeerCount;
 
         public override void DisconnectLocalClient()
         {
@@ -165,11 +145,6 @@ namespace Netcode.Transports.MultipeerConnectivity
         public override unsafe ulong GetCurrentRtt(ulong clientId)
         {
             return 0;
-        }
-
-        public override void Initialize(NetworkManager networkManager = null)
-        {
-
         }
 
         private MCSessionSendDataMode NetworkDeliveryToSendDataMode(NetworkDelivery delivery)
@@ -210,30 +185,22 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public override bool StartClient()
+        public override void Initialize(NetworkManager networkManager = null)
         {
-            // if (LogLevel <= LogLevel.Developer)
-            //     Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Starting as client.");
+            if (m_Inited)
+                return;
 
-            // connectionManager = SteamNetworkingSockets.ConnectRelay<ConnectionManager>(targetSteamId);
-            // connectionManager.Interface = this;
-            return true;
-        }
+            if (UserDisplayName == null)
+                UserDisplayName = SystemInfo.deviceName;
+            var serviceType = MultipeerConnectivitySettings.GetOrCreateSettings().BonjourServiceType;
+            if (string.IsNullOrEmpty(serviceType))
+            {
+                Debug.LogError("Multipeer Connectivity for Netcode for GameObjects is missing required settings. Please provide them in the Multipeer Connectivity section of your Project Settings.");
+                return;
+            }
+            m_MCSession = new MCSession(PeerID, UserDisplayName, StartMode, serviceType);
 
-        public override bool StartServer()
-        {
-            // if (LogLevel <= LogLevel.Developer)
-            //     Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Starting as server.");
-
-            // socketManager = SteamNetworkingSockets.CreateRelaySocket<SocketManager>();
-            // socketManager.Interface = this;
-            return true;
-        }
-
-        public override bool StartPeerToPeer()
-        {
-            Initialize();
-            return base.StartPeerToPeer();
+            base.Initialize(networkManager);
         }
 
         public override void ShutdownPeerToPeer()
@@ -241,7 +208,6 @@ namespace Netcode.Transports.MultipeerConnectivity
             if (!m_Inited)
                 return;
             base.ShutdownPeerToPeer();
-            m_MCSession.Dispose();
         }
 
         protected override void AcceptPeer(PeerInfo peer)
@@ -358,22 +324,6 @@ namespace Netcode.Transports.MultipeerConnectivity
                 #endregion
 */
         #region Utility Methods
-
-        private void Initialize()
-        {
-            if (m_Inited)
-                return;
-            if (UserDisplayName == null)
-                UserDisplayName = SystemInfo.deviceName;
-            var serviceType = MultipeerConnectivitySettings.GetOrCreateSettings().BonjourServiceType;
-            if (string.IsNullOrEmpty(serviceType))
-            {
-                Debug.LogError("Multipeer Connectivity for Netcode for GameObjects is missing required settings. Please provide them in the Multipeer Connectivity section of your Project Settings.");
-                return;
-            }
-            m_MCSession = new MCSession(PeerID, UserDisplayName, StartMode, serviceType);
-            m_Inited = true;
-        }
 
         #endregion
     }
