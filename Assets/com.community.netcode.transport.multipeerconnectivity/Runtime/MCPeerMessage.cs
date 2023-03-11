@@ -10,7 +10,7 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         public bool Valid => m_Ptr != IntPtr.Zero;
 
-        public string peerID
+        public Guid peerID
         {
             get
             {
@@ -19,7 +19,7 @@ namespace Netcode.Transports.MultipeerConnectivity
 
                 using (var peerID = GetPeerID(this))
                 {
-                    return peerID.ToString();
+                    return peerID.ToGuid();
                 }
             }
         }
@@ -48,7 +48,7 @@ namespace Netcode.Transports.MultipeerConnectivity
         public static bool operator !=(MCPeerMessage lhs, MCPeerMessage rhs) => !lhs.Equals(rhs);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_PeerMessage_peerID")]
-        static extern NSString GetPeerID(MCPeerMessage peerMessage);
+        static extern NSUUID GetPeerID(MCPeerMessage peerMessage);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_PeerMessage_data")]
         static extern NSData GetData(MCPeerMessage peerMessage);

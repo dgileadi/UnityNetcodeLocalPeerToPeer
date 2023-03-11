@@ -26,10 +26,13 @@ using Unity.Netcode;
 
 namespace Netcode.LocalPeerToPeer
 {
+
+
+// TODO: should this class [RequireComponent typeof(ConnectionAdjudicator)]?
+// if so, would/should multiple local transports share the same adjudicator?
+
     public abstract class LocalP2PTransport : NetworkTransport
     {
-        protected static readonly byte[] TransportLevelMessageHeader = { 0xFF, 0xBA, 0xE0 };
-
         /// <summary>
         /// The ID of this peer. Defaults to a generated Guid.
         /// <para>
@@ -38,7 +41,7 @@ namespace Netcode.LocalPeerToPeer
         /// started.
         /// </para>
         /// </summary>
-        public Guid PeerID { get; set; } = Guid.NewGuid();
+        public Guid PeerID { get; set; }
 
         /// <summary>
         /// The mode this transport was started in. If started in Server or Client
@@ -78,6 +81,12 @@ namespace Netcode.LocalPeerToPeer
         public ConnectionAdjudicator ConnectionAdjudicator;
 
         /// <summary>
+        /// A component that sends and handles transport-level messages. A default
+        /// is created at runtime if one is not provided.
+        /// </summary>
+        public TransportLevelMessages TransportLevelMessages;
+
+        /// <summary>
         /// The number of peers this transport knows about.
         /// </summary>
         public int KnownPeerCount => m_MessageRecipients.Count;
@@ -88,7 +97,7 @@ namespace Netcode.LocalPeerToPeer
         /// </summary>
         public abstract int DirectlyConnectedPeerCount { get; }
 
-        public override ulong ServerClientId => m_ConnectedPeersByIDs.GetValueOrDefault(m_ServerPeerID, 0ul);
+        public override ulong ServerClientId => m_ConnectedPeersByIDs.GetValueOrDefault(ServerPeerID, 0ul);
 
         /// <summary>
         /// Whether this transport has been started.
@@ -96,15 +105,15 @@ namespace Netcode.LocalPeerToPeer
         public bool Started { get; protected set; }
 
         /// <summary>
-        /// Whether this transport has a server.
+        /// Whether this transport has (or is) a server.
         /// </summary>
-        public bool HasServer => m_ServerPeerID != default && m_ServerPeerID != PeerID;
+        public bool HasServer => ServerPeerID != default;
 
         /// <summary>
         /// Whether this transport is indirectly connected to the server through
         /// a relay peer.
         /// </summary>
-        public bool IsRelayed => m_RelayPeerID != default;
+        public bool IsRelayed => RelayPeerID != default;
 
         /// <summary>
         /// Whether this transport is a relay between a server and other peers.
@@ -116,33 +125,48 @@ namespace Netcode.LocalPeerToPeer
         /// server peer if directly connected, or else <c>default</c> if this
         /// peer isn't connected to any other peer.
         /// </summary>
-        public Guid RelayOrServerPeerID => m_RelayPeerID == default ? m_ServerPeerID : m_RelayPeerID;
+        public Guid RelayOrServerPeerID => RelayPeerID == default ? ServerPeerID : RelayPeerID;
 
         /// <summary>
         /// The ID of this transport's server, or <c>default</c> if it has no
         /// server. If this transport is a host it is this transport's own
         /// <c>PeerID</c>.
         /// </summary>
-        public Guid ServerPeerID => m_ServerPeerID;
+        public Guid ServerPeerID
+        {
+            get => m_ServerPeerID;
+            protected internal set
+            {
+                if (!m_ConnectedPeersByIDs.ContainsKey(value))
+                {
+                    var serverClientId = GenerateClientId(value);
+                    m_ConnectedPeers.Add(serverClientId, value);
+                    m_ConnectedPeersByIDs.Add(value, serverClientId);
+                    m_MessageRecipients.Add(value, RelayPeerID == default ? value : RelayPeerID);
+                }
+                m_ServerPeerID = value;
+            }
+        }
+        private Guid m_ServerPeerID;
 
         /// <summary>
         /// The ID of this transport's relay peer, or <c>default</c> if it has no
         /// relay peer.
         /// </summary>
-        public Guid RelayPeerID => m_RelayPeerID;
+        public Guid RelayPeerID { get; protected internal set; }
 
 // TODO: document these:
         protected bool m_Inited;
         protected Dictionary<ulong, Guid> m_ConnectedPeers = new Dictionary<ulong, Guid>();
         protected Dictionary<Guid, ulong> m_ConnectedPeersByIDs = new Dictionary<Guid, ulong>();
         protected Dictionary<Guid, Guid> m_MessageRecipients = new Dictionary<Guid, Guid>();
-        protected List<PendingTransportLevelMessage> m_PendingTransportLevelMessages = new List<PendingTransportLevelMessage>();
-        protected Guid m_ServerPeerID;
-        protected Guid m_RelayPeerID;
+        protected Dictionary<Guid, PickServerDecision> m_PendingConnections = new Dictionary<Guid, PickServerDecision>();
         protected ulong m_NextClientId = 1;
         protected bool m_SuspendDisconnectingClients;
         protected Coroutine m_ChangeModeCoroutine;
         internal protected LogLevel LogLevel => NetworkManager.Singleton.LogLevel;
+
+        #region Public API
 
         public override void Initialize(NetworkManager networkManager = null)
         {
@@ -186,41 +210,6 @@ namespace Netcode.LocalPeerToPeer
             return StartWithMode(PeerMode.Client);
         }
 
-        protected virtual bool StartWithMode(PeerMode mode)
-        {
-            if (Started)
-                return true;
-
-            if (!m_Inited)
-            {
-                Initialize(NetworkManager.Singleton);
-                m_Inited = true;
-            }
-
-            if (ConnectionAdjudicator == null)
-                ConnectionAdjudicator = FindObjectOfType<ConnectionAdjudicator>(true);
-            if (ConnectionAdjudicator == null)
-            {
-                if (LogLevel <= LogLevel.Normal)
-                    Debug.LogWarning($"[{this.GetType().Name}] - A ConnectionAdjudicator component wasn't present in the scene; creating one on " + this + ".");
-                ConnectionAdjudicator = gameObject.AddComponent<ConnectionAdjudicator>();
-            }
-            if (ConnectionAdjudicator.Transport == null)
-                ConnectionAdjudicator.Transport = this;
-
-            StartMode = mode;
-
-            if (mode == PeerMode.Server)
-                RunAsServer();
-            else if (mode == PeerMode.Client)
-                RunAsClient();
-            else
-                RunAsPeerToPeer();
-
-            Started = true;
-            return true;
-        }
-
         /// <summary>
         /// Stops peer advertising and discovering and shuts down the transport.
         /// </summary>
@@ -240,7 +229,7 @@ namespace Netcode.LocalPeerToPeer
 
             if (m_ConnectedPeers.TryGetValue(clientId, out Guid peerID))
             {
-                SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
+                TransportLevelMessages.SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
                 m_ConnectedPeers.Remove(clientId);
                 m_ConnectedPeersByIDs.Remove(peerID);
                 m_MessageRecipients.Remove(peerID);
@@ -250,6 +239,292 @@ namespace Netcode.LocalPeerToPeer
             }
             else if (LogLevel <= LogLevel.Normal)
                 Debug.LogWarning($"[{this.GetType().Name}] - Failed to disconnect remote client with ID {clientId}, client not connected.");
+        }
+
+        public override void Send(ulong clientId, ArraySegment<byte> data, NetworkDelivery delivery)
+        {
+            Guid peerID;
+            if (clientId == ServerClientId)
+                peerID = ServerPeerID;
+            else if (!m_ConnectedPeers.TryGetValue(clientId, out peerID))
+            {
+                if (LogLevel <= LogLevel.Normal)
+                    Debug.LogWarning($"[{this.GetType().Name}] - Attempted to send data to unconnected client: {clientId}");
+                return;
+            }
+
+            var throughPeerID = m_MessageRecipients[peerID];
+            if (throughPeerID == peerID)
+                SendToPeer(peerID, data, delivery);
+            else
+                TransportLevelMessages.SendRelayMessage(peerID, throughPeerID, data, delivery);
+        }
+
+        public override NetworkEvent PollEvent(out ulong clientId, out ArraySegment<byte> payload, out float receiveTime)
+        {
+            clientId = 0;
+            receiveTime = Time.realtimeSinceStartup;
+            payload = default;
+            return NetworkEvent.Nothing;
+        }
+
+        public bool IsConnectedToPeer(Guid peerID) => m_MessageRecipients.ContainsKey(peerID);
+
+        public bool IsPendingConnectionToPeer(Guid peerID) => m_PendingConnections.ContainsKey(peerID);
+
+        public bool TryGetRecipientPeerID(Guid peerID, out Guid recipientPeerID)
+        {
+            return m_MessageRecipients.TryGetValue(peerID, out recipientPeerID);
+        }
+
+        #endregion
+
+        #region Methods a child class must implement
+
+        protected abstract void InviteDiscoveredPeer(PeerInfo peer);
+
+        protected abstract void RejectDiscoveredPeer(PeerInfo peer);
+
+        protected abstract void AcceptInvitationFrom(PeerInfo peer);
+
+        protected abstract void RejectInvitationFrom(PeerInfo peer);
+
+        protected internal abstract void SendToPeer(Guid peerID, ArraySegment<byte> data, NetworkDelivery delivery);
+
+        #endregion
+
+        #region Methods a child class should call to handle network events
+
+        protected void PeerDiscovered(PeerInfo peer)
+        {
+            // reject cycles and impossible connections
+            if (!ConnectionAdjudicator.ShouldConnectTo(peer))
+            {
+                RejectDiscoveredPeer(peer);
+                return;
+            }
+
+            m_PendingConnections.Add(peer.PeerID, default);
+
+            ConnectionAdjudicator.HandlePeerDiscovered(peer, accept =>
+            {
+                if (accept)
+                    InviteDiscoveredPeer(peer);
+                else
+                {
+                    m_PendingConnections.Remove(peer.PeerID);
+                    RejectDiscoveredPeer(peer);
+                }
+            });
+        }
+
+        protected void ReceivedInvitation(PeerInvitation invitation)
+        {
+// avoid cycles
+// TODO: and avoid other impossible situations
+/*
+// Don't accept if we're already connected
+// Always accept if we haven't sent our own invitation to the peer
+// Otherwise accept if our ID is lower than theirs so that only one peer accepts
+BOOL shouldAccept = ![m_Session.connectedPeers containsObject:mcPeerID] &&
+        ((!knownByID) || [peerInfo.peerID compare:m_PeerInfo.peerID] == NSOrderedDescending);
+
+`PickServer` aborts if a server is connecting as a client to a relay, and if
+the other server would connect to it instead (i.e. only allow one server to
+connect to a relay of the other)
+*/
+            var sendInvitation = !m_MessageRecipients.ContainsKey(invitation.PeerID);
+            PickServerDecision decision = default;
+            if (sendInvitation)
+            {
+                decision = ConnectionAdjudicator.PickServer(invitation);
+                sendInvitation = decision.Connect;
+            }
+
+            if (!sendInvitation)
+            {
+                m_PendingConnections.Remove(invitation.PeerID);
+                RejectInvitationFrom(invitation);
+                return;
+            }
+
+            m_PendingConnections[invitation.PeerID] = decision;
+
+            var twoServersConnecting = this.HasServer && invitation.HasServer;
+            ConnectionAdjudicator.HandleInvitation(invitation, twoServersConnecting, accept =>
+            {
+                if (accept)
+                {
+                    AcceptInvitationFrom(invitation);
+                }
+                else
+                {
+                    RejectInvitationFrom(invitation);
+                    m_PendingConnections.Remove(invitation.PeerID);
+                }
+            });
+        }
+
+        protected virtual void PeerConnected(PeerInfo peer)
+        {
+            var clientId = GenerateClientId(peer.PeerID);
+            m_ConnectedPeers.Add(clientId, peer.PeerID);
+            m_ConnectedPeersByIDs.Add(peer.PeerID, clientId);
+            m_MessageRecipients.Add(peer.PeerID, peer.PeerID);
+
+            if (StartMode == peer.StartMode && StartMode != PeerMode.PeerToPeer)
+            {
+                if (LogLevel <= LogLevel.Error)
+                    Debug.LogError($"[{this.GetType().Name}] - This transport and {peer.PeerID} both started in {StartMode} mode and shouldn't have connected.");
+                DisconnectRemoteClient(clientId);
+                return;
+            }
+
+            PickServerDecision decision;
+            if (m_PendingConnections.TryGetValue(peer.PeerID, out decision))
+            {
+// TODO: handle the decision
+                TransportLevelMessages.SendPickServerDecision(peer.PeerID, decision);
+            }
+            else
+            {
+                TransportLevelMessages.WaitForTransportLevelMessageFrom(peer.PeerID, TransportLevelMessageType.PickServerDecision, payload =>
+                {
+// TODO: handle the decision
+                });
+            }
+
+            if (!decision.Connect)
+            {
+// FIXME: telling the remote client to disconnect *doesn't work* because
+// Multipeer Connectivity doesn't allow you to disconnect a peer from a session!
+/*
+How this needs to work:
+
+An browser sees an advertiser, and asks whether to join. The advertiser's data
+is not up to date; i.e. it doesn't know whether the advertiser is/has a server,
+etc.
+
+If the query to join is accepted by the adjudicator, the browser sends an
+invitation to the advertiser. The advertiser sees the invitation and asks whether
+to accept. The invitation's data is up to date, including mode and server ID.
+Thus the advertiser can properly judge whether to ask whether to accept.
+
+If the adjudicator accepts the invitation, the peers join.
+
+If two unattached peers are advertising and browsing, let's go through the scenarios:
+
+1. both peers see the advertisement and record the other peer's ID:
+    - both peers send an invitation
+    - both peers receive an invitation
+    - since both peers already know about the other peer, only one of them accepts
+
+2. peer A sees the advertisement and records the other peer's ID:
+    - peer A sends an invitation
+    - peer B receives an invitation before seeing peer A's advertisement
+    - since peer B doesn't know about peer A, peer B accepts
+
+From a peer's perspective, when I receive an invitation I either know about the
+other peer or I don't. If I do then I accept conditionally.
+*/
+                DisconnectRemoteClient(m_ConnectedPeersByIDs[peer.PeerID]);
+                // TODO: clear out dictionaries too
+                return;
+            }
+
+            if (decision.Mode == PeerMode.Server)
+                this.RelayPeerID = default;
+            else if (decision.Mode == PeerMode.Client)
+                this.RelayPeerID = decision.PickedPeerID == this.PeerID ? default : decision.PickedPeerID;
+            this.ServerPeerID = decision.ServerPeerID;
+
+            if (decision.PickedPeerID == PeerID && decision.Mode == PeerMode.Server)
+                RunAsServer();
+            else
+                RunAsClient();
+        }
+
+        protected internal virtual void RelayedPeerConnected(Guid peerID, Guid relayerPeerID, ArraySegment<byte> payload)
+        {
+            var clientId = GenerateClientId(peerID);
+            m_ConnectedPeers.Add(clientId, peerID);
+            m_ConnectedPeersByIDs.Add(peerID, clientId);
+            m_MessageRecipients.Add(peerID, relayerPeerID);
+
+            if (NetworkManager.Singleton.IsServer)
+                InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
+            else
+                TransportLevelMessages.SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, payload, NetworkDelivery.Reliable);
+        }
+
+        protected void ReceivedPeerMessage(Guid fromPeerID, ArraySegment<byte> payload)
+        {
+            if (TransportLevelMessages.HandleTransportLevelMessage(fromPeerID, payload))
+                return;
+            else if (m_ConnectedPeersByIDs.ContainsKey(fromPeerID))
+                InvokeOnTransportEvent(NetworkEvent.Data, m_ConnectedPeersByIDs[fromPeerID], payload, Time.realtimeSinceStartup);
+            else if (LogLevel <= LogLevel.Error)
+                Debug.LogError($"[{this.GetType().Name}] - Received message from unknown peer with ID {fromPeerID}.");
+        }
+
+        protected void PeerDisconnected(PeerInfo peer)
+        {
+            if (peer.PeerID == RelayPeerID || peer.PeerID == ServerPeerID)
+                LostConnectionToServer(peer);
+            else
+                LostConnectionToClient(peer);
+        }
+
+        #endregion
+
+        #region Implementation
+
+        protected virtual bool StartWithMode(PeerMode mode)
+        {
+            if (Started)
+                return true;
+
+            if (!m_Inited)
+            {
+                Initialize(NetworkManager.Singleton);
+                m_Inited = true;
+            }
+
+            if (PeerID == default)
+                PeerID = Guid.NewGuid();
+
+            ConnectionAdjudicator = GetOrCreateComponent<ConnectionAdjudicator>(ConnectionAdjudicator);
+            if (ConnectionAdjudicator.Transport == null)
+                ConnectionAdjudicator.Transport = this;
+
+            TransportLevelMessages = GetOrCreateComponent<TransportLevelMessages>(TransportLevelMessages);
+            if (TransportLevelMessages.Transport == null)
+                TransportLevelMessages.Transport = this;
+
+            StartMode = mode;
+
+            if (mode == PeerMode.Server)
+                RunAsServer();
+            else if (mode == PeerMode.Client)
+                RunAsClient();
+            else
+                RunAsPeerToPeer();
+
+            Started = true;
+            return true;
+        }
+
+        protected T GetOrCreateComponent<T>(T component) where T : MonoBehaviour
+        {
+            if (component == null)
+                component = FindObjectOfType<T>(true);
+            if (component == null)
+            {
+                if (LogLevel <= LogLevel.Normal)
+                    Debug.LogWarning($"[{this.GetType().Name}] - A {typeof(T).Name} component wasn't present in the scene; creating one on " + this + ".");
+                component = gameObject.AddComponent<T>();
+            }
+            return component;
         }
 
         protected virtual void RunAsPeerToPeer()
@@ -314,7 +589,7 @@ namespace Netcode.LocalPeerToPeer
                 InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
             }
             Advertising = DirectlyConnectedPeerCount < PeerLimit;
-            Discovering = true; // servers need to discover other servers
+            Discovering = StartMode == PeerMode.PeerToPeer; // servers need to discover other servers
         }
 
         protected virtual IEnumerator DoRunAsClient()
@@ -325,10 +600,13 @@ namespace Netcode.LocalPeerToPeer
                 NetworkManager.Singleton.StartClient();
             foreach (var peerID in m_ConnectedPeersByIDs.Keys)
             {
-                if (peerID == m_ServerPeerID)
-                    continue;
-                SendRelayPeerConnected(peerID);
-                SendServerChanged(peerID);
+                if (peerID == ServerPeerID)
+                    InvokeOnTransportEvent(NetworkEvent.Connect, ServerClientId, null, Time.realtimeSinceStartup);
+                else
+                {
+                    TransportLevelMessages.SendRelayPeerConnected(peerID);
+                    TransportLevelMessages.SendServerChanged(peerID);
+                }
             }
             Advertising = IsRelayer && DirectlyConnectedPeerCount < PeerLimit;
             Discovering = !HasServer;
@@ -343,119 +621,6 @@ namespace Netcode.LocalPeerToPeer
                 yield return null;
 
             m_SuspendDisconnectingClients = false;
-        }
-
-        protected void PeerDiscovered(PeerInfo peer)
-        {
-            // avoid circles
-            if (IsClient(peer.PeerID))
-            {
-                RejectPeer(peer);
-                return;
-            }
-
-            ConnectionAdjudicator.HandlePeerDiscovered(peer, accept =>
-            {
-                if (accept)
-                    AcceptPeer(peer);
-                else
-                    RejectPeer(peer);
-            });
-        }
-
-        protected bool IsClient(Guid peerID)
-        {
-            return m_MessageRecipients.ContainsKey(peerID);
-        }
-
-        protected abstract void AcceptPeer(PeerInfo peer);
-
-        protected abstract void RejectPeer(PeerInfo peer);
-
-        protected abstract void SendToPeer(Guid peerID, ArraySegment<byte> data, NetworkDelivery delivery);
-
-        public override void Send(ulong clientId, ArraySegment<byte> data, NetworkDelivery delivery)
-        {
-            Guid peerID;
-            if (clientId == ServerClientId)
-                peerID = m_ServerPeerID;
-            else if (!m_ConnectedPeers.TryGetValue(clientId, out peerID))
-            {
-                if (LogLevel <= LogLevel.Normal)
-                    Debug.LogWarning($"[{this.GetType().Name}] - Attempted to send data to unconnected client: {clientId}");
-                return;
-            }
-
-            var throughPeerID = m_MessageRecipients[peerID];
-            if (throughPeerID == peerID)
-                SendToPeer(peerID, data, delivery);
-            else
-                SendRelayMessage(peerID, throughPeerID, data, delivery);
-        }
-
-        public override NetworkEvent PollEvent(out ulong clientId, out ArraySegment<byte> payload, out float receiveTime)
-        {
-            clientId = 0;
-            receiveTime = Time.realtimeSinceStartup;
-            payload = default;
-            return NetworkEvent.Nothing;
-        }
-
-        protected virtual void PeerConnected(PeerInfo peer)
-        {
-            var clientId = GenerateClientId(peer.PeerID);
-            m_ConnectedPeers.Add(clientId, peer.PeerID);
-            m_ConnectedPeersByIDs.Add(peer.PeerID, clientId);
-            m_MessageRecipients.Add(peer.PeerID, peer.PeerID);
-
-            if (StartMode == peer.StartMode && StartMode != PeerMode.PeerToPeer)
-            {
-                if (LogLevel <= LogLevel.Error)
-                    Debug.LogError($"[{this.GetType().Name}] - This transport and {peer.PeerID} both started in {StartMode} mode and shouldn't have connected.");
-                DisconnectRemoteClient(clientId);
-                return;
-            }
-
-            StartCoroutine(ConnectionAdjudicator.PickServer(peer, (success, pickedPeerID, serverPeerID, mode) =>
-            {
-                if (!success)
-                {
-                    DisconnectRemoteClient(m_ConnectedPeersByIDs[peer.PeerID]);
-                    return;
-                }
-
-                this.m_ServerPeerID = serverPeerID;
-                if (mode == PeerMode.Server)
-                    this.m_RelayPeerID = default;
-                else if (mode == PeerMode.Client)
-                    this.m_RelayPeerID = pickedPeerID == this.PeerID ? default : pickedPeerID;
-
-                if (pickedPeerID == PeerID && mode == PeerMode.Server)
-                    RunAsServer();
-                else
-                    RunAsClient();
-            }));
-        }
-
-        protected void ReceivedPeerMessage(Guid fromPeerID, ArraySegment<byte> payload)
-        {
-            if (IsTransportLevelMessage(payload))
-            {
-                var type = (TransportLevelMessageType)payload[3];
-                HandleTransportLevelMessage(fromPeerID, type, payload);
-            }
-            else if (m_ConnectedPeersByIDs.ContainsKey(fromPeerID))
-                InvokeOnTransportEvent(NetworkEvent.Data, m_ConnectedPeersByIDs[fromPeerID], payload, Time.realtimeSinceStartup);
-            else if (LogLevel <= LogLevel.Error)
-                Debug.LogError($"[{this.GetType().Name}] - Received message from unknown peer with ID {fromPeerID}.");
-        }
-
-        protected void PeerDisconnected(PeerInfo peer)
-        {
-            if (peer.PeerID == m_RelayPeerID || peer.PeerID == m_ServerPeerID)
-                LostConnectionToServer(peer);
-            else
-                LostConnectionToClient(peer);
         }
 
         protected virtual void LostConnectionToClient(PeerInfo peer)
@@ -510,265 +675,12 @@ namespace Netcode.LocalPeerToPeer
             return ++m_NextClientId;
         }
 
-        # region Transport-Level Messages
-
-        protected virtual void SendRelayPeerConnected(Guid peerID)
+        protected internal void SetPeerReachedThrough(Guid peerID, Guid throughPeerID)
         {
-            SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, new RelayPeerIDPayload(peerID), NetworkDelivery.Reliable);
-        }
-
-        protected virtual void SendServerChanged(Guid peerID)
-        {
-            SendTransportLevelMessage(peerID, TransportLevelMessageType.RelayServerChanged, new RelayPeerIDPayload(m_ServerPeerID), NetworkDelivery.Reliable);
-        }
-
-        protected virtual void SendRelayMessage(Guid toPeerID, Guid throughPeerID, ArraySegment<byte> message, NetworkDelivery delivery)
-        {
-            var relayHeader = new RelayMessage(toPeerID, delivery);
-
-            using var writer = new FastBufferWriter(4 + FastBufferWriter.GetWriteSize<RelayMessage>() + message.Count, Allocator.Temp);
-            writer.WriteBytes(TransportLevelMessageHeader);
-            writer.WriteByte((byte)TransportLevelMessageType.RelayMessage);
-            writer.WriteValue(relayHeader);
-            writer.WriteBytes(message.Array, message.Count, message.Offset);
-
-            SendTransportLevelMessage(throughPeerID, TransportLevelMessageType.RelayMessage, writer.ToArray(), delivery);
-        }
-
-        /// <summary>
-        /// Send a payload to the specified peer, data and networkDelivery that
-        /// will be handled internally by the other peer's LocalP2PTransport rather
-        /// than delivered to its NetworkManager.
-        /// </summary>
-        /// <param name="peerID">The peerID to send to</param>
-        /// <param name="type">The type of transport-level message</param>
-        /// <param name="payload">The data to send</param>
-        /// <param name="payloadMaxSizeInBytes">The maximum size in bytes of the payload</param>
-        /// <param name="networkDelivery">The delivery type (QoS) to send data with</param>
-        internal protected void SendTransportLevelMessage(Guid peerID, TransportLevelMessageType type, INetworkSerializable payload, int payloadMaxSizeInBytes, NetworkDelivery networkDelivery)
-        {
-            using var writer = new FastBufferWriter(payloadMaxSizeInBytes + 4, Allocator.Temp);
-            writer.WriteBytes(TransportLevelMessageHeader);
-            writer.WriteByte((byte)type);
-            writer.WriteNetworkSerializable(payload);
-            SendTransportLevelMessage(peerID, type, new ArraySegment<byte>(writer.ToArray()), networkDelivery);
-        }
-
-        /// <summary>
-        /// Send a payload to the specified peer, data and networkDelivery that
-        /// will be handled internally by the other peer's LocalP2PTransport rather
-        /// than delivered to its NetworkManager.
-        /// </summary>
-        /// <typeparam name="T">The generic type of the payload. Must be entirely unmanaged.</typeparam>
-        /// <param name="peerID">The peerID to send to</param>
-        /// <param name="type">The type of transport-level message</param>
-        /// <param name="payload">The data to send</param>
-        /// <param name="networkDelivery">The delivery type (QoS) to send data with</param>
-        internal protected void SendTransportLevelMessage<T>(Guid peerID, TransportLevelMessageType type, T payload, NetworkDelivery networkDelivery, FastBufferWriter.ForStructs unused = default) where T : unmanaged, INetworkSerializeByMemcpy
-        {
-            using var writer = new FastBufferWriter(FastBufferWriter.GetWriteSize<T>() + 4, Allocator.Temp);
-            writer.WriteBytes(TransportLevelMessageHeader);
-            writer.WriteByte((byte)type);
-            writer.WriteValue(payload);
-            SendTransportLevelMessage(peerID, type, new ArraySegment<byte>(writer.ToArray()), networkDelivery);
-        }
-
-        /// <summary>
-        /// Send a payload to the specified peer, data and networkDelivery that
-        /// will be handled internally by the other peer's LocalP2PTransport rather
-        /// than delivered to its NetworkManager.
-        /// </summary>
-        /// <param name="peerID">The peerID to send to</param>
-        /// <param name="type">The type of transport-level message</param>
-        /// <param name="payload">The data to send</param>
-        /// <param name="networkDelivery">The delivery type (QoS) to send data with</param>
-        internal protected void SendTransportLevelMessage(Guid peerID, TransportLevelMessageType type, ArraySegment<byte> payload, NetworkDelivery networkDelivery)
-        {
-            if (m_ConnectedPeersByIDs.TryGetValue(peerID, out ulong clientId))
-            {
-                if (!IsTransportLevelMessage(payload))
-                    payload = new ArraySegment<byte>(TransportLevelMessageHeader.Append((byte)type).Concat(payload).ToArray());
-
-                Send(clientId, payload, networkDelivery);
-            }
-            else if (LogLevel <= LogLevel.Error)
-                Debug.LogError($"[{this.GetType().Name}] - Failed to send transport-level message to peer with ID {peerID}, client not connected.");
-        }
-
-        internal protected T ReadValue<T>(ArraySegment<byte> bytes, FastBufferWriter.ForStructs unused = default) where T : unmanaged, INetworkSerializeByMemcpy
-        {
-            var reader = new FastBufferReader(bytes, Allocator.Temp);
-            T message;
-            reader.ReadValue(out message);
-            return message;
-        }
-
-        internal protected T ReadValue<T>(ArraySegment<byte> bytes) where T : INetworkSerializable, new()
-        {
-            var reader = new FastBufferReader(bytes, Allocator.Temp);
-            T message;
-            reader.ReadNetworkSerializable(out message);
-            return message;
-        }
-
-        internal protected IEnumerator WaitForTransportLevelMessageFrom(Guid peerID, TransportLevelMessageType type, Action<ArraySegment<byte>?> callback, float timeout = 10)
-        {
-            var timeoutTime = timeout > 0 ? Time.realtimeSinceStartup + timeout : float.MaxValue;
-            m_PendingTransportLevelMessages.Add(new PendingTransportLevelMessage(peerID, type));
-            ArraySegment<byte>? received;
-            while ((received = m_PendingTransportLevelMessages.FirstOrDefault(pending => pending.Received(peerID, type)).Message) == null && Time.realtimeSinceStartup <= timeoutTime)
-                yield return null;
-            m_PendingTransportLevelMessages.RemoveAll(pending => pending.Matches(peerID, type));
-            callback.Invoke(received);
-        }
-
-        /// <summary>
-        /// Determine whether the payload is an internal transport-level message.
-        /// </summary>
-        /// <param name="payload">The received data</param>
-        /// <returns><c>true</c> if the payload is intended to be handled
-        /// internally by the transport, <c>false</c> if it is intended to be
-        /// forwarded to the NetworkManager</returns>
-        protected bool IsTransportLevelMessage(ArraySegment<byte> payload)
-        {
-            return payload.Count >= TransportLevelMessageHeader.Length
-                    && payload[0] == TransportLevelMessageHeader[0]
-                    && payload[1] == TransportLevelMessageHeader[1]
-                    && payload[2] == TransportLevelMessageHeader[2];
-        }
-
-        protected virtual void HandleTransportLevelMessage(Guid fromPeerID, TransportLevelMessageType type, ArraySegment<byte> payload)
-        {
-            var pendingMessage = m_PendingTransportLevelMessages.FirstOrDefault(message => message.Matches(fromPeerID, type));
-            if (pendingMessage.Matches(fromPeerID, type))
-            {
-                pendingMessage.Message = payload.Slice(4);
-                return;
-            }
-
-            switch (type)
-            {
-                case TransportLevelMessageType.DisconnectCommand:
-                    DisconnectLocalClient();
-                    break;
-
-                case TransportLevelMessageType.RelayPeerConnected:
-                    HandleRelayPeerConnected(fromPeerID, payload.Slice(4));
-                    break;
-
-                case TransportLevelMessageType.RelayServerChanged:
-                    HandleRelayServerChanged(fromPeerID, payload.Slice(4));
-                    break;
-
-                case TransportLevelMessageType.RelayPeerDisconnected:
-                    // TODO:
-                    break;
-
-                case TransportLevelMessageType.RelayMessage:
-                    HandleRelayMessage(fromPeerID, payload);
-                    break;
-            }
-        }
-
-        protected virtual void HandleRelayPeerConnected(Guid fromPeerID, ArraySegment<byte> payload)
-        {
-            var peerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
-
-            var clientId = GenerateClientId(peerID);
-            m_ConnectedPeers.Add(clientId, peerID);
-            m_ConnectedPeersByIDs.Add(peerID, clientId);
-            m_MessageRecipients.Add(peerID, fromPeerID);
-
-            if (NetworkManager.Singleton.IsServer)
-                InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
-            else
-                SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, payload, NetworkDelivery.Reliable);
-        }
-
-        protected virtual void HandleRelayServerChanged(Guid fromPeerID, ArraySegment<byte> payload)
-        {
-            m_ServerPeerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
-            m_MessageRecipients[m_ServerPeerID] = fromPeerID;
-        }
-
-        protected virtual void HandleRelayMessage(Guid fromPeerID, ArraySegment<byte> payload)
-        {
-            var relayMessage = ReadValue<RelayMessage>(payload.Slice(4));
-            if (!m_MessageRecipients.TryGetValue(relayMessage.ToPeerID, out Guid throughPeerID))
-            {
-                if (LogLevel <= LogLevel.Error)
-                    Debug.LogError($"[{this.GetType().Name}] - Asked to relay to unknown peer {relayMessage.ToPeerID}.");
-                return;
-            }
-
-            if (relayMessage.ToPeerID == throughPeerID)
-                SendToPeer(relayMessage.ToPeerID, payload.Slice(4), relayMessage.Delivery);
-            else
-                SendTransportLevelMessage(throughPeerID, TransportLevelMessageType.RelayMessage, payload, relayMessage.Delivery);
-        }
-
-
-        protected struct PendingTransportLevelMessage
-        {
-            public readonly Guid PeerID;
-            public readonly TransportLevelMessageType Type;
-            public ArraySegment<byte>? Message;
-
-            public PendingTransportLevelMessage(Guid PeerID, TransportLevelMessageType Type)
-            {
-                this.PeerID = PeerID;
-                this.Type = Type;
-                this.Message = null;
-            }
-
-            public bool Matches(Guid peerID, TransportLevelMessageType type)
-            {
-                return peerID == PeerID && type == Type;
-            }
-
-            public bool Received(Guid peerID, TransportLevelMessageType type)
-            {
-                return Matches(peerID, type) && Message != null;
-            }
-        }
-
-
-        protected struct RelayPeerIDPayload : INetworkSerializeByMemcpy
-        {
-            public Guid PeerID { get; set; }
-
-            public RelayPeerIDPayload(Guid peerID)
-            {
-                this.PeerID = peerID;
-            }
-        }
-
-
-        protected struct RelayMessage : INetworkSerializeByMemcpy
-        {
-            public Guid ToPeerID { get; set; }
-            public NetworkDelivery Delivery { get; set; }
-
-            public RelayMessage(Guid toPeerID, NetworkDelivery delivery)
-            {
-                this.ToPeerID = toPeerID;
-                this.Delivery = delivery;
-            }
+            m_MessageRecipients[peerID] = throughPeerID;
         }
 
         #endregion
-
-    }
-
-
-    public enum TransportLevelMessageType : byte
-    {
-        NegotiateServer,
-        DisconnectCommand,
-        RelayPeerConnected,
-        RelayPeerDisconnected,
-        RelayServerChanged,
-        RelayMessage,
     }
 
 }

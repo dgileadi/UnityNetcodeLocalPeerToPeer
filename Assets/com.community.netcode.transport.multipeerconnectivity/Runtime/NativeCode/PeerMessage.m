@@ -2,7 +2,7 @@
 
 @implementation PeerMessage
 
-- (nullable instancetype)initWithPeerID:(nonnull NSString *)peerID data:(nonnull NSData *)data
+- (nullable instancetype)initWithPeerID:(nonnull NSUUID *)peerID data:(nonnull NSData *)data
 {
     if (self = [super init])
     {

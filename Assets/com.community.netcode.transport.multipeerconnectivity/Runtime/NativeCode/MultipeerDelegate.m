@@ -6,7 +6,9 @@ MCSession* m_Session;
 MCPeerID* m_PeerID;
 PeerInfo* m_PeerInfo;
 NSMutableDictionary *m_PeerInfoByID;
+NSMutableDictionary *m_HandlerByID;
 NSMutableArray* m_DiscoveredQueue;
+NSMutableArray* m_InvitationQueue;
 NSMutableArray* m_ConnectedQueue;
 NSMutableArray* m_DisconnectedQueue;
 NSMutableArray* m_Queue;
@@ -24,10 +26,12 @@ BOOL m_Browsing;
         m_Browsing = false;
         m_Queue = [[NSMutableArray alloc] init];
         m_DiscoveredQueue = [[NSMutableArray alloc] init];
+        m_InvitationQueue = [[NSMutableArray alloc] init];
         m_ConnectedQueue = [[NSMutableArray alloc] init];
         m_DisconnectedQueue = [[NSMutableArray alloc] init];
         m_ErrorQueue = [[NSMutableArray alloc] init];
         m_PeerInfoByID = [[NSMutableDictionary alloc] init];
+        m_HandlerByID = [[NSMutableDictionary alloc] init];
         m_PeerID = [[MCPeerID alloc] initWithDisplayName: peerInfo.displayName];
         m_PeerInfo = peerInfo;
         m_Session = [[MCSession alloc] initWithPeer:m_PeerID
@@ -108,7 +112,7 @@ BOOL m_Browsing;
     return error;
 }
 
-- (MCPeerID *)findMCPeerID(nonnull NSString *)peerID
+- (MCPeerID *)findMCPeerID(nonnull NSUUID *)peerID
 {
     @synchronized (m_PeerInfoByID)
     {
@@ -119,7 +123,7 @@ BOOL m_Browsing;
     return nil;
 }
 
-- (NSError*)sendToPeerID(nonnull NSString*)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode
+- (NSError*)sendToPeerID(nonnull NSUUID*)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode
 {
     if (m_Session.connectedPeers.count == 0)
         return nil;
@@ -191,6 +195,24 @@ BOOL m_Browsing;
     }
 }
 
+- (NSUInteger)invitationQueueSize
+{
+    @synchronized (m_InvitationQueue)
+    {
+        return m_InvitationQueue.count;
+    }
+}
+
+- (nonnull PeerInfo*)dequeueInvitation
+{
+    @synchronized (m_InvitationQueue)
+    {
+        PeerInfo* peerInfo = [m_InvitationQueue objectAtIndex:0];
+        [m_InvitationQueue removeObjectAtIndex:0];
+        return peerInfo;
+    }
+}
+
 - (NSUInteger)connectedQueueSize
 {
     @synchronized (m_ConnectedQueue)
@@ -241,6 +263,10 @@ BOOL m_Browsing;
     @synchronized (m_DiscoveredQueue)
     {
         [m_DiscoveredQueue removeAllObjects];
+    }
+    @synchronized (m_InvitationQueue)
+    {
+        [m_InvitationQueue removeAllObjects];
     }
     @synchronized (m_ConnectedQueue)
     {
@@ -336,27 +362,21 @@ BOOL m_Browsing;
     PeerInfo *peerInfo = [NSKeyedUnarchiver unarchivedObjectOfClass:[PeerInfo class] fromData:context error:nil];
     peerInfo.displayName = mcPeerID.displayName;
 
-    BOOL knownByID;
     @synchronized (m_PeerInfoByID)
     {
-        knownByID = [m_PeerInfoByID objectForKey:mcPeerID] != nil;
+        if (![m_PeerInfoByID objectForKey:mcPeerID])
+            [m_PeerInfoByID setObject:peerInfo forKey:mcPeerID];
     }
 
-    // Don't accept if we're already connected
-    // Always accept if we haven't sent our own invitation to the peer
-    // Otherwise accept if our ID is lower than theirs so that only one peer accepts
-    BOOL shouldAccept = ![m_Session.connectedPeers containsObject:mcPeerID] &&
-            ((!knownByID) || [peerInfo.peerID compare:m_PeerInfo.peerID] == NSOrderedDescending);
-
-    if (!knownByID)
+    @synchronized (m_HandlerByID)
     {
-        @synchronized (m_PeerInfoByID)
-        {
-            [m_PeerInfoByID setObject:peerUserID forKey:mcPeerID];
-        }
+        [m_HandlerByID setObject:invitationHandler forKey:peerInfo.peerID];
     }
 
-    invitationHandler(shouldAccept, m_Session);
+    @synchronized (m_InvitationQueue)
+    {
+        [m_InvitationQueue addObject:peerInfo];
+    }
 }
 
 - (void)advertiser:(MCNearbyServiceAdvertiser *)advertiser didNotStartAdvertisingPeer:(NSError *)error
@@ -387,17 +407,17 @@ BOOL m_Browsing;
     }
 }
 
-- (NSError*)inviteDiscoveredPeer:(nonnull NSString *)peerID
+- (NSError*)inviteDiscoveredPeer:(nonnull NSUUID *)peerID (nonnull PeerInfo *)invitation
 {
     MCPeerID *mcPeerID = [findMCPeerID peerID];
     if (mcPeerID == nil)
     {
-        NSString *description = [NSString stringWithFormat:@"Unable to find an MCPeerID for ID string %@", peerID];
+        NSString *description = [NSString stringWithFormat:@"Unable to find a MCPeerID for peer ID %@", peerID];
         NSDictionary *userInfo = @{ NSLocalizedDescriptionKey : description };
         return [NSError errorWithDomain:@"Netcode.Transports.MultipeerConnectivity.ErrorDomain" code:-404 userInfo:nil];
     }
 
-    NSData *context = [NSKeyedArchiver archivedDataWithRootObject:m_PeerInfo requiringSecureCoding:FALSE error:nil];
+    NSData *context = [NSKeyedArchiver archivedDataWithRootObject:invitation requiringSecureCoding:FALSE error:nil];
 
     // Invite the peer to join our session
     [browser invitePeer:mcPeerID
@@ -408,8 +428,47 @@ BOOL m_Browsing;
     return nil;
 }
 
-- (void)rejectDiscoveredPeer:(nonnull NSString *)peerID
+- (void)rejectDiscoveredPeer:(nonnull NSUUID *)peerID
 {
+    @synchronized (m_PeerInfoByID)
+    {
+        for (MCPeerID *key in m_PeerInfoByID)
+            if ([peerID isEqual(m_PeerInfoByID[key].peerID))
+                [m_PeerInfoByID removeObjectForKey:key];
+    }
+}
+
+- (nullable NSError *)acceptInvitationFrom:(nonnull NSUUID *)peerID
+{
+    void (^invitationHandler)(BOOL, MCSession * _Nullable);
+    @synchronized (m_HandlerByID)
+    {
+        invitationHandler = [m_HandlerByID objectForKey:peerID];
+        [m_HandlerByID removeObjectForKey:peerID];
+    }
+
+    if (invitationHandler == nil)
+    {
+        NSString *description = [NSString stringWithFormat:@"Unable to find an invitation handler for peer ID %@", peerID];
+        NSDictionary *userInfo = @{ NSLocalizedDescriptionKey : description };
+        return [NSError errorWithDomain:@"Netcode.Transports.MultipeerConnectivity.ErrorDomain" code:-405 userInfo:nil];
+    }
+
+    invitationHandler(TRUE, m_Session);
+}
+
+- (void)rejectInvitationFrom:(nonnull NSUUID *)peerID
+{
+    void (^invitationHandler)(BOOL, MCSession * _Nullable);
+    @synchronized (m_HandlerByID)
+    {
+        invitationHandler = [m_HandlerByID objectForKey:peerID];
+        [m_HandlerByID removeObjectForKey:peerID];
+    }
+
+    if (invitationHandler != nil)
+        invitationHandler(FALSE, m_Session);
+
     @synchronized (m_PeerInfoByID)
     {
         for (MCPeerID *key in m_PeerInfoByID)

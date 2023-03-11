@@ -3,7 +3,7 @@
 
 void* UnityMC_PeerMessage_peerID(void* ptr)
 {
-    NSString* peerID = ((__bridge PeerMessage*)ptr).peerID;
+    NSUUID* peerID = ((__bridge PeerMessage*)ptr).peerID;
     return (__bridge_retained void*)peerID;
 }
 

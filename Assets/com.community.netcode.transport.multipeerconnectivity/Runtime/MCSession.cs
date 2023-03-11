@@ -77,7 +77,7 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public void SendToPeer(string peerID, NSData data, MCSessionSendDataMode mode)
+        public void SendToPeer(Guid peerID, NSData data, MCSessionSendDataMode mode)
         {
             if (!created)
                 throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
@@ -85,35 +85,59 @@ namespace Netcode.Transports.MultipeerConnectivity
             if (!data.Created)
                 throw new ArgumentException($"'{nameof(data)}' is not valid.", nameof(data));
 
-            using (var peerID_NSString = new NSString(peerID))
-            using (var error = SendToPeer(this, peerID_NSString, data, mode))
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
+            using (var error = SendToPeer(this, peerID_NSUUID, data, mode))
             {
                 if (error.Valid)
                     throw error.ToException();
             }
         }
 
-        public void InviteDiscoveredPeer(string peerID)
+        public void InviteDiscoveredPeer(Guid peerID, MCPeerInfo invitation)
         {
             if (!created)
                 throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
 
-            using (var peerID_NSString = new NSString(peerID))
-            using (var error = InviteDiscoveredPeer(this, peerID_NSString))
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
+            using (var error = InviteDiscoveredPeer(this, peerID_NSUUID, invitation))
             {
                 if (error.Valid)
                     throw error.ToException();
             }
         }
 
-        public void RejectDiscoveredPeer(string peerID)
+        public void RejectDiscoveredPeer(Guid peerID)
         {
             if (!created)
                 throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
 
-            using (var peerID_NSString = new NSString(peerID))
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
             {
-                RejectDiscoveredPeer(this, peerID_NSString);
+                RejectDiscoveredPeer(this, peerID_NSUUID);
+            }
+        }
+
+        public void AcceptInvitationFrom(Guid peerID)
+        {
+            if (!created)
+                throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
+
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
+            using (var error = AcceptInvitationFrom(this, peerID_NSUUID))
+            {
+                if (error.Valid)
+                    throw error.ToException();
+            }
+        }
+
+        public void RejectInvitationFrom(Guid peerID)
+        {
+            if (!created)
+                throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
+
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
+            {
+                RejectInvitationFrom(this, peerID_NSUUID);
             }
         }
 
@@ -145,6 +169,16 @@ namespace Netcode.Transports.MultipeerConnectivity
                 throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
 
             return DequeueDiscoveredPeer(this);
+        }
+
+        public int invitationQueueSize => GetInvitationQueueSize(this);
+
+        public MCPeerInfo DequeueInvitation()
+        {
+            if (!created)
+                throw new InvalidOperationException($"The {typeof(MCSession).Name} has not been created.");
+
+            return DequeueInvitation(this);
         }
 
         public int connectedQueueSize => GetConnectedQueueSize(this);
@@ -181,20 +215,26 @@ namespace Netcode.Transports.MultipeerConnectivity
         public static bool operator==(MCSession lhs, MCSession rhs) => lhs.Equals(rhs);
         public static bool operator!=(MCSession lhs, MCSession rhs) => !lhs.Equals(rhs);
 
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_initWithPeerInfo")]
+        static extern IntPtr InitWithPeerInfo(MCPeerInfo peerInfo, NSString serviceType);
+
         [DllImport("__Internal", EntryPoint="UnityMC_Delegate_sendToAllPeers")]
         static extern NSError SendToAllPeers(MCSession self, NSData data, MCSessionSendDataMode mode);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_sendToPeer")]
-        static extern NSError SendToPeer(MCSession self, NSString userID, NSData data, MCSessionSendDataMode mode);
-
-        [DllImport("__Internal", EntryPoint="UnityMC_Delegate_initWithPeerInfo")]
-        static extern IntPtr InitWithPeerInfo(MCPeerInfo peerInfo, NSString serviceType);
+        static extern NSError SendToPeer(MCSession self, NSUUID userID, NSData data, MCSessionSendDataMode mode);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_inviteDiscoveredPeer")]
-        static extern NSError InviteDiscoveredPeer(MCSession self, NSString peerID);
+        static extern NSError InviteDiscoveredPeer(MCSession self, NSUUID peerID, MCPeerInfo invitation);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_rejectDiscoveredPeer")]
-        static extern void RejectDiscoveredPeer(MCSession self, NSString peerID);
+        static extern void RejectDiscoveredPeer(MCSession self, NSUUID peerID);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_acceptInvitationFrom")]
+        static extern NSError AcceptInvitationFrom(MCSession self, NSUUID peerID);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_rejectInvitationFrom")]
+        static extern void RejectInvitationFrom(MCSession self, NSUUID peerID);
 
         [DllImport("__Internal", EntryPoint="UnityMC_Delegate_receivedDataQueueSize")]
         static extern int GetReceivedDataQueueSize(MCSession self);
@@ -214,7 +254,13 @@ namespace Netcode.Transports.MultipeerConnectivity
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_dequeueDiscoveredPeer")]
         static extern MCPeerInfo DequeueDiscoveredPeer(MCSession self);
 
-        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_ConnectedQueueSize")]
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_invitationQueueSize")]
+        static extern int GetInvitationQueueSize(MCSession self);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_dequeueInvitation")]
+        static extern MCPeerInfo DequeueInvitation(MCSession self);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_connectedQueueSize")]
         static extern int GetConnectedQueueSize(MCSession self);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_dequeueConnectedPeer")]

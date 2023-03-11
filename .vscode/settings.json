@@ -54,7 +54,8 @@
     },
     "cSpell.words": [
         "multipeer",
-        "Netcode"
+        "Netcode",
+        "NSUUID"
     ],
     "omnisharp.useModernNet": false
 }

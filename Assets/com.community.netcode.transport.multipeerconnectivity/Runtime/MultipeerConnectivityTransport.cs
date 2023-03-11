@@ -76,11 +76,13 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         private void Update()
         {
-            while (m_MCSession.discoveredQueueSize > 0)
+            // process connections before invitations, and those before discoveries
+            // so that the logic in PeerConnected and ReceivedInvitation works
+            while (m_MCSession.disconnectedQueueSize > 0)
             {
-                using (var peerInfo = m_MCSession.DequeueDiscoveredPeer())
+                using (var peerInfo = m_MCSession.DequeueDisconnectedPeer())
                 {
-                    PeerDiscovered(peerInfo);
+                    PeerDisconnected(peerInfo);
                 }
             }
 
@@ -92,31 +94,36 @@ namespace Netcode.Transports.MultipeerConnectivity
                 }
             }
 
-            while (m_MCSession.disconnectedQueueSize > 0)
+            while (m_MCSession.invitationQueueSize > 0)
             {
-                using (var peerInfo = m_MCSession.DequeueDisconnectedPeer())
+                using (var peerInfo = m_MCSession.DequeueInvitation())
                 {
-                    PeerDisconnected(peerInfo);
+                    ReceivedInvitation(peerInfo);
                 }
             }
 
-            // check for errors encountered
+            while (m_MCSession.discoveredQueueSize > 0)
+            {
+                using (var peerInfo = m_MCSession.DequeueDiscoveredPeer())
+                {
+                    PeerDiscovered(peerInfo);
+                }
+            }
+
             while (m_MCSession.errorCount > 0)
             {
                 using (var error = m_MCSession.DequeueError())
                 {
-                    Debug.LogError("Error " + error.Code + " from Multipeer Connectivity: " + error.Description);
-                    // TODO: maybe base the status on error codes instead
+                    if (LogLevel <= LogLevel.Error)
+                        Debug.LogError("Error " + error.Code + " from Multipeer Connectivity: " + error.Description);
                 }
             }
 
-            // check for incoming data
             while (m_MCSession.receivedDataQueueSize > 0)
             {
                 using (var peerMessage = m_MCSession.DequeueReceivedData())
                 {
-                    var peerID = peerMessage.peerID;
-                    ReceivedPeerMessage(new Guid(peerMessage.peerID), new ArraySegment<byte>(peerMessage.data.NativeArrayNoCopy.ToArray()));
+                    ReceivedPeerMessage(peerMessage.peerID, new ArraySegment<byte>(peerMessage.data.NativeArrayNoCopy.ToArray()));
                 }
             }
         }
@@ -180,8 +187,9 @@ namespace Netcode.Transports.MultipeerConnectivity
         {
             var sendMode = NetworkDeliveryToSendDataMode(delivery);
             using (var nsData = NSData.CreateWithBytesNoCopy(data))
+            using (var uuid = NSUUID.CreateWithGuid(peerID))
             {
-                m_MCSession.SendToPeer(peerID.ToString(), nsData, sendMode);
+                m_MCSession.SendToPeer(peerID, nsData, sendMode);
             }
         }
 
@@ -210,14 +218,28 @@ namespace Netcode.Transports.MultipeerConnectivity
             base.ShutdownPeerToPeer();
         }
 
-        protected override void AcceptPeer(PeerInfo peer)
+        protected override void InviteDiscoveredPeer(PeerInfo peer)
         {
-            m_MCSession.InviteDiscoveredPeer(peer.PeerID.ToString());
+            var invitation = new MCPeerInfo(PeerID, UserDisplayName, StartMode);
+            invitation.Mode = Mode;
+            invitation.PeerCount = (byte)KnownPeerCount;
+            invitation.ServerPeerID = ServerPeerID;
+            m_MCSession.InviteDiscoveredPeer(peer.PeerID, invitation);
         }
 
-        protected override void RejectPeer(PeerInfo peer)
+        protected override void RejectDiscoveredPeer(PeerInfo peer)
         {
-            m_MCSession.RejectDiscoveredPeer(peer.PeerID.ToString());
+            m_MCSession.RejectDiscoveredPeer(peer.PeerID);
+        }
+
+        protected override void AcceptInvitationFrom(PeerInfo peer)
+        {
+            m_MCSession.AcceptInvitationFrom(peer.PeerID);
+        }
+
+        protected override void RejectInvitationFrom(PeerInfo peer)
+        {
+            m_MCSession.RejectInvitationFrom(peer.PeerID);
         }
 
         #endregion

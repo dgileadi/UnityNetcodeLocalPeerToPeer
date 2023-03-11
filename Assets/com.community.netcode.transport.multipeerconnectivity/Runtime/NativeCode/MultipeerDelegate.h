@@ -5,11 +5,15 @@
 
 - (nullable instancetype)initWithPeerInfo:(nonnull PeerInfo *)peerInfo serviceType:(nonnull NSString *)serviceType;
 - (nullable NSError*)sendToAllPeers:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode;
-- (nullable NSError*)sendToPeerID:(nonnull NSString *)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode;
-- (nullable NSError*)inviteDiscoveredPeer:(nonnull NSString *)peerID;
-- (void)rejectDiscoveredPeer:(nonnull NSString *)peerID;
+- (nullable NSError*)sendToPeerID:(nonnull NSUUID *)peerID data:(nonnull NSData*)data withMode:(MCSessionSendDataMode)mode;
+- (nullable NSError*)inviteDiscoveredPeer:(nonnull NSUUID *)peerID (nonnull PeerInfo *)invitation;
+- (void)rejectDiscoveredPeer:(nonnull NSUUID *)peerID;
+- (nullable NSError *)acceptInvitationFrom:(nonnull NSUUID *)peerID;
+- (void)rejectInvitationFrom:(nonnull NSUUID *)peerID;
 - (NSUInteger)discoveredQueueSize;
 - (nonnull PeerInfo*)dequeueDiscoveredPeer;
+- (NSUInteger)invitationQueueSize;
+- (nonnull PeerInfo*)dequeueInvitation;
 - (NSUInteger)connectedQueueSize;
 - (nonnull PeerInfo*)dequeueConnectedPeer;
 - (NSUInteger)disconnectedQueueSize;

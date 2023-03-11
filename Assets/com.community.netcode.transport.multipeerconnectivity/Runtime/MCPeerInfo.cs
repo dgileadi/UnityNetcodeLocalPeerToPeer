@@ -1,11 +1,12 @@
 using Netcode.LocalPeerToPeer;
 using System;
 using System.Runtime.InteropServices;
+using UnityEngine;
 
 namespace Netcode.Transports.MultipeerConnectivity
 {
     [StructLayout(LayoutKind.Sequential)]
-    public struct MCPeerInfo : PeerInfo, IDisposable, IEquatable<MCPeerInfo>
+    public struct MCPeerInfo : PeerInfo, PeerInvitation, IDisposable, IEquatable<MCPeerInfo>
     {
         IntPtr m_Ptr;
 
@@ -20,7 +21,7 @@ namespace Netcode.Transports.MultipeerConnectivity
 
                 using (var peerID = GetPeerID(this))
                 {
-                    return Guid.Parse(peerID.ToString());
+                    return peerID.ToGuid();
                 }
             }
         }
@@ -39,17 +40,56 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public PeerMode StartMode => (PeerMode)GetMode(this);
+        public PeerMode StartMode => (PeerMode)GetStartMode(this);
 
-        public MCPeerInfo(Guid peerID, string displayName, PeerMode mode)
+        public RuntimePlatform Platform => (RuntimePlatform)GetPlatform(this);
+
+        public PeerMode Mode
+        {
+            get => (PeerMode)GetMode(this);
+            set => SetMode(this, (byte)value);
+        }
+
+        public byte PeerCount
+        {
+            get => GetPeerCount(this);
+            set => SetPeerCount(this, (byte)value);
+        }
+
+        public Guid ServerPeerID
+        {
+            get
+            {
+                if (!Valid)
+                    throw new InvalidOperationException($"The {typeof(MCPeerInfo).Name} is not valid.");
+
+                using (var serverPeerID = GetServerPeerID(this))
+                {
+                    return serverPeerID.ToGuid();
+                }
+            }
+            set
+            {
+                if (!Valid)
+                    throw new InvalidOperationException($"The {typeof(MCPeerInfo).Name} is not valid.");
+
+                using (var serverUUID = NSUUID.CreateWithGuid(value))
+                {
+                    SetServerPeerID(this, serverUUID);
+                }
+            }
+        }
+
+
+        public MCPeerInfo(Guid peerID, string displayName, PeerMode startMode)
         {
             if (displayName == null)
                 throw new ArgumentNullException(nameof(displayName));
 
-            using (var peerID_NSString = new NSString(peerID.ToString()))
+            using (var peerID_NSUUID = NSUUID.CreateWithGuid(peerID))
             using (var displayName_NSString = new NSString(displayName))
             {
-                m_Ptr = InitWithPeerID(peerID_NSString, displayName_NSString, (byte)mode);
+                m_Ptr = InitWithPeerID(peerID_NSUUID, displayName_NSString, (byte)startMode, (byte)Application.platform);
             }
         }
 
@@ -62,15 +102,36 @@ namespace Netcode.Transports.MultipeerConnectivity
         public static bool operator !=(MCPeerInfo lhs, MCPeerInfo rhs) => !lhs.Equals(rhs);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_Delegate_initWithPeerID")]
-        static extern IntPtr InitWithPeerID(NSString peerID, NSString displayName, byte mode);
+        static extern IntPtr InitWithPeerID(NSUUID peerID, NSString displayName, byte startMode, byte platform);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_peerID")]
-        static extern NSString GetPeerID(MCPeerInfo peerInfo);
+        static extern NSUUID GetPeerID(MCPeerInfo peerInfo);
 
         [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_displayName")]
         static extern NSString GetDisplayName(MCPeerInfo peerInfo);
 
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_startMode")]
+        static extern byte GetStartMode(MCPeerInfo peerInfo);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_platform")]
+        static extern byte GetPlatform(MCPeerInfo peerInfo);
+
         [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_mode")]
         static extern byte GetMode(MCPeerInfo peerInfo);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_setMode")]
+        static extern void SetMode(MCPeerInfo peerInfo, byte mode);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_peerCount")]
+        static extern byte GetPeerCount(MCPeerInfo peerInfo);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_setPeerCount")]
+        static extern void SetPeerCount(MCPeerInfo peerInfo, byte peerCount);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_serverPeerID")]
+        static extern NSUUID GetServerPeerID(MCPeerInfo peerInfo);
+
+        [DllImport("__Internal", EntryPoint = "UnityMC_PeerInfo_setServerPeerID")]
+        static extern void SetServerPeerID(MCPeerInfo peerInfo, NSUUID serverPeerID);
     }
 }
