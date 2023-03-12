@@ -38,9 +38,19 @@ namespace Netcode.LocalPeerToPeer
             SendTransportLevelMessage(Transport.RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, new RelayPeerIDPayload(peerID), NetworkDelivery.Reliable);
         }
 
+        public virtual void SendRelayPeerDisconnected(Guid peerID)
+        {
+            SendTransportLevelMessage(Transport.RelayOrServerPeerID, TransportLevelMessageType.RelayPeerDisconnected, new RelayPeerIDPayload(peerID), NetworkDelivery.Reliable);
+        }
+
         public virtual void SendServerChanged(Guid peerID)
         {
             SendTransportLevelMessage(peerID, TransportLevelMessageType.RelayServerChanged, new RelayPeerIDPayload(Transport.ServerPeerID), NetworkDelivery.Reliable);
+        }
+
+        public virtual void SendDisconnectRequest(Guid peerID)
+        {
+            SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
         }
 
         public virtual void SendRelayMessage(Guid toPeerID, Guid throughPeerID, ArraySegment<byte> message, NetworkDelivery delivery)
@@ -194,7 +204,7 @@ namespace Netcode.LocalPeerToPeer
                     break;
 
                 case TransportLevelMessageType.RelayPeerDisconnected:
-                    // TODO:
+                    HandleRelayPeerDisconnected(fromPeerID, payload.Slice(4));
                     break;
 
                 case TransportLevelMessageType.RelayMessage:
@@ -207,6 +217,12 @@ namespace Netcode.LocalPeerToPeer
         {
             var peerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
             Transport.RelayedPeerConnected(peerID, fromPeerID, payload);
+        }
+
+        protected virtual void HandleRelayPeerDisconnected(Guid fromPeerID, ArraySegment<byte> payload)
+        {
+            var peerID = ReadValue<RelayPeerIDPayload>(payload).PeerID;
+            Transport.RelayedPeerDisconnected(peerID, fromPeerID, payload);
         }
 
         protected virtual void HandleRelayServerChanged(Guid fromPeerID, ArraySegment<byte> payload)

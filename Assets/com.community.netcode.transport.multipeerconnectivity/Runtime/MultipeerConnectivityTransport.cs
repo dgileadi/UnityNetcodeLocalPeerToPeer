@@ -1,34 +1,12 @@
 using Netcode.LocalPeerToPeer;
 using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
 using Unity.Netcode;
 using UnityEngine;
-using Unity.Collections.LowLevel.Unsafe;
-
-// TODO:
-// 1. get this working
-// 2. figure out user IDs
-// 3. figure out how to choose a server/clients
-// 4. figure out connection limits and maybe ways around that (like multiple
-//    sessions, or relays, or trees, or...?)
-// 5. stop advertising when connection limit reached
-
-// FIXME: avoid Guid/String conversions
 
 namespace Netcode.Transports.MultipeerConnectivity
 {
     public class MultipeerConnectivityTransport : LocalP2PTransport
     {
-        /// <summary>
-        /// The ID of the local user.
-        /// </summary>
-        [SerializeField]
-        [Tooltip("The ID of the local user.")]
-// FIXME: get this from the clientId or generate a GUID or something
-        public string UserID;
-
         /// <summary>
         /// The display name of the local user.
         /// </summary>
@@ -46,19 +24,6 @@ namespace Netcode.Transports.MultipeerConnectivity
         [Tooltip("An override for the maximum number of peers this transport should accept, not including itself; zero means use the transport's maximum")]
         public int OverridePeerLimit = 0;
 
-        public override bool Advertising { get => m_MCSession.advertising; protected set => m_MCSession.advertising = value; }
-
-        public override bool Discovering { get => m_MCSession.browsing; protected set => m_MCSession.browsing = value; }
-
-        protected override int PeerLimit
-        {
-            get
-            {
-                int transportLimit = (int)(m_MCSession.maximumNumberOfPeers - 1);
-                return (OverridePeerLimit > 0 && OverridePeerLimit < transportLimit) ? OverridePeerLimit : transportLimit;
-            }
-        }
-
         private MCSession m_MCSession;
 
         #region MonoBehaviour Messages
@@ -73,6 +38,9 @@ namespace Netcode.Transports.MultipeerConnectivity
             ShutdownPeerToPeer();
             m_MCSession.Dispose();
         }
+
+// FIXME: handle the situation when the app gets backgrounded, and disconnect
+// see https://www.toptal.com/ios/collusion-ios-multipeerconnectivity
 
         private void Update()
         {
@@ -130,7 +98,20 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         #endregion
 
-        #region NetworkTransport Overrides
+        #region LocalP2PTransport Overrides
+
+        public override bool Advertising { get => m_MCSession.advertising; protected set => m_MCSession.advertising = value; }
+
+        public override bool Discovering { get => m_MCSession.browsing; protected set => m_MCSession.browsing = value; }
+
+        protected override int PeerLimit
+        {
+            get
+            {
+                int transportLimit = (int)(m_MCSession.maximumNumberOfPeers - 1);
+                return (OverridePeerLimit > 0 && OverridePeerLimit < transportLimit) ? OverridePeerLimit : transportLimit;
+            }
+        }
 
         public override bool IsSupported => Application.platform == RuntimePlatform.IPhonePlayer
                 || Application.platform == RuntimePlatform.OSXPlayer
@@ -138,33 +119,34 @@ namespace Netcode.Transports.MultipeerConnectivity
 
         public override int DirectlyConnectedPeerCount => m_MCSession.connectedPeerCount;
 
-        public override void DisconnectLocalClient()
+        public override void Initialize(NetworkManager networkManager = null)
         {
-            if (m_SuspendDisconnectingClients)
+            if (m_Inited)
                 return;
 
-            if (LogLevel <= LogLevel.Developer)
-                Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnecting local client.");
+            if (UserDisplayName == null)
+                UserDisplayName = SystemInfo.deviceName;
+            var serviceType = MultipeerConnectivitySettings.GetOrCreateSettings().BonjourServiceType;
+            if (string.IsNullOrEmpty(serviceType))
+            {
+                Debug.LogError("Multipeer Connectivity for Netcode for GameObjects is missing required settings. Please provide them in the Multipeer Connectivity section of your Project Settings.");
+                return;
+            }
+            m_MCSession = new MCSession(PeerID, UserDisplayName, StartMode, serviceType);
 
-            m_MCSession.Disconnect();
+            base.Initialize(networkManager);
+        }
+
+        public override void ShutdownPeerToPeer()
+        {
+            if (!m_Inited)
+                return;
+            base.ShutdownPeerToPeer();
         }
 
         public override unsafe ulong GetCurrentRtt(ulong clientId)
         {
             return 0;
-        }
-
-        private MCSessionSendDataMode NetworkDeliveryToSendDataMode(NetworkDelivery delivery)
-        {
-            return delivery switch
-            {
-                NetworkDelivery.Reliable => MCSessionSendDataMode.Reliable,
-                NetworkDelivery.ReliableFragmentedSequenced => MCSessionSendDataMode.Reliable,
-                NetworkDelivery.ReliableSequenced => MCSessionSendDataMode.Reliable,
-                NetworkDelivery.Unreliable => MCSessionSendDataMode.Unreliable,
-                NetworkDelivery.UnreliableSequenced => MCSessionSendDataMode.Unreliable,
-                _ => MCSessionSendDataMode.Reliable
-            };
         }
 
         public override void Shutdown()
@@ -193,29 +175,17 @@ namespace Netcode.Transports.MultipeerConnectivity
             }
         }
 
-        public override void Initialize(NetworkManager networkManager = null)
+        private MCSessionSendDataMode NetworkDeliveryToSendDataMode(NetworkDelivery delivery)
         {
-            if (m_Inited)
-                return;
-
-            if (UserDisplayName == null)
-                UserDisplayName = SystemInfo.deviceName;
-            var serviceType = MultipeerConnectivitySettings.GetOrCreateSettings().BonjourServiceType;
-            if (string.IsNullOrEmpty(serviceType))
+            return delivery switch
             {
-                Debug.LogError("Multipeer Connectivity for Netcode for GameObjects is missing required settings. Please provide them in the Multipeer Connectivity section of your Project Settings.");
-                return;
-            }
-            m_MCSession = new MCSession(PeerID, UserDisplayName, StartMode, serviceType);
-
-            base.Initialize(networkManager);
-        }
-
-        public override void ShutdownPeerToPeer()
-        {
-            if (!m_Inited)
-                return;
-            base.ShutdownPeerToPeer();
+                NetworkDelivery.Reliable => MCSessionSendDataMode.Reliable,
+                NetworkDelivery.ReliableFragmentedSequenced => MCSessionSendDataMode.Reliable,
+                NetworkDelivery.ReliableSequenced => MCSessionSendDataMode.Reliable,
+                NetworkDelivery.Unreliable => MCSessionSendDataMode.Unreliable,
+                NetworkDelivery.UnreliableSequenced => MCSessionSendDataMode.Unreliable,
+                _ => MCSessionSendDataMode.Reliable
+            };
         }
 
         protected override void InviteDiscoveredPeer(PeerInfo peer)
@@ -242,110 +212,16 @@ namespace Netcode.Transports.MultipeerConnectivity
             m_MCSession.RejectInvitationFrom(peer.PeerID);
         }
 
-        #endregion
-        /*
-                #region ConnectionManager Implementation
+        public override void DisconnectLocalClient()
+        {
+            if (m_SuspendDisconnectingClients)
+                return;
 
-                private byte[] payloadCache = new byte[4096];
+            if (LogLevel <= LogLevel.Developer)
+                Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnecting local client.");
 
-                private void EnsurePayloadCapacity(int size)
-                {
-                    if (payloadCache.Length >= size)
-                        return;
-
-                    payloadCache = new byte[Math.Max(payloadCache.Length * 2, size)];
-                }
-
-                void IConnectionManager.OnConnecting(ConnectionInfo info)
-                {
-                    if (LogLevel <= LogLevel.Developer)
-                        Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Connecting with Steam user {info.Identity.SteamId}.");
-                }
-
-                void IConnectionManager.OnConnected(ConnectionInfo info)
-                {
-                    InvokeOnTransportEvent(NetworkEvent.Connect, ServerClientId, default, Time.realtimeSinceStartup);
-
-                    if (LogLevel <= LogLevel.Developer)
-                        Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Connected with Steam user {info.Identity.SteamId}.");
-                }
-
-                void IConnectionManager.OnDisconnected(ConnectionInfo info)
-                {
-                    InvokeOnTransportEvent(NetworkEvent.Disconnect, ServerClientId, default, Time.realtimeSinceStartup);
-
-                    if (LogLevel <= LogLevel.Developer)
-                        Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnected Steam user {info.Identity.SteamId}.");
-                }
-
-                unsafe void IConnectionManager.OnMessage(IntPtr data, int size, long messageNum, long recvTime, int channel)
-                {
-                    EnsurePayloadCapacity(size);
-
-                    fixed (byte* payload = payloadCache)
-                    {
-                        UnsafeUtility.MemCpy(payload, (byte*)data, size);
-                    }
-
-                    InvokeOnTransportEvent(NetworkEvent.Data, ServerClientId, new ArraySegment<byte>(payloadCache, 0, size), Time.realtimeSinceStartup);
-                }
-
-                #endregion
-
-                #region SocketManager Implementation
-
-                void ISocketManager.OnConnecting(SocketConnection connection, ConnectionInfo info)
-                {
-                    if (LogLevel <= LogLevel.Developer)
-                        Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Accepting connection from Steam user {info.Identity.SteamId}.");
-
-                    connection.Accept();
-                }
-
-                void ISocketManager.OnConnected(SocketConnection connection, ConnectionInfo info)
-                {
-                    if (!m_ConnectedPeers.ContainsKey(connection.Id))
-                    {
-                        m_ConnectedPeers.Add(connection.Id, new Client()
-                        {
-                            connection = connection,
-                            steamId = info.Identity.SteamId
-                        });
-
-                        InvokeOnTransportEvent(NetworkEvent.Connect, connection.Id, default, Time.realtimeSinceStartup);
-
-                        if (LogLevel <= LogLevel.Developer)
-                            Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Connected with Steam user {info.Identity.SteamId}.");
-                    }
-                    else if (LogLevel <= LogLevel.Normal)
-                        Debug.LogWarning($"[{nameof(MultipeerConnectivityTransport)}] - Failed to connect client with ID {connection.Id}, client already connected.");
-                }
-
-                void ISocketManager.OnDisconnected(SocketConnection connection, ConnectionInfo info)
-                {
-                    m_ConnectedPeers.Remove(connection.Id);
-
-                    InvokeOnTransportEvent(NetworkEvent.Disconnect, connection.Id, default, Time.realtimeSinceStartup);
-
-                    if (LogLevel <= LogLevel.Developer)
-                        Debug.Log($"[{nameof(MultipeerConnectivityTransport)}] - Disconnected Steam user {info.Identity.SteamId}");
-                }
-
-                unsafe void ISocketManager.OnMessage(SocketConnection connection, NetIdentity identity, IntPtr data, int size, long messageNum, long recvTime, int channel)
-                {
-                    EnsurePayloadCapacity(size);
-
-                    fixed (byte* payload = payloadCache)
-                    {
-                        UnsafeUtility.MemCpy(payload, (byte*)data, size);
-                    }
-
-                    InvokeOnTransportEvent(NetworkEvent.Data, connection.Id, new ArraySegment<byte>(payloadCache, 0, size), Time.realtimeSinceStartup);
-                }
-
-                #endregion
-*/
-        #region Utility Methods
+            m_MCSession.Disconnect();
+        }
 
         #endregion
     }

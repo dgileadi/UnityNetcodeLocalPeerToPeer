@@ -6,23 +6,8 @@ using UnityEngine;
 using Unity.Collections;
 using Unity.Netcode;
 
-// TODO: things this class might do:
-// - work with LocalP2PNetworkManagerExtensions to start/stop p2p sessions
-//   before/after NetworkManager
-// - provide hooks for picking a server, whether to connect, what to do
-//   after a disconnect, etc.
-// - heartbeat
-// - relay
-
-// algorithm for picking a server: https://paulbellamy.com/2017/02/a-distributed-trustless-coin-flip-algorithm
-// - along with advertising, send a user ID and guess hash
-// - once connected, each peer sends the other their actual guess
-// - the winner becomes the server
-
 // TODO: maybe heartbeat/disconnect support, assuming the underlying transport
 // doesn't do it for us
-
-// TODO: maybe use string peerIDs for compatibility
 
 namespace Netcode.LocalPeerToPeer
 {
@@ -137,7 +122,7 @@ namespace Netcode.LocalPeerToPeer
             get => m_ServerPeerID;
             protected internal set
             {
-                if (!m_ConnectedPeersByIDs.ContainsKey(value))
+                if (value != default && !m_ConnectedPeersByIDs.ContainsKey(value))
                 {
                     var serverClientId = GenerateClientId(value);
                     m_ConnectedPeers.Add(serverClientId, value);
@@ -227,18 +212,30 @@ namespace Netcode.LocalPeerToPeer
             if (m_SuspendDisconnectingClients)
                 return;
 
-            if (m_ConnectedPeers.TryGetValue(clientId, out Guid peerID))
+            if (!m_ConnectedPeers.TryGetValue(clientId, out Guid peerID))
             {
-                TransportLevelMessages.SendTransportLevelMessage(peerID, TransportLevelMessageType.DisconnectCommand, new ArraySegment<byte>(), NetworkDelivery.Unreliable);
-                m_ConnectedPeers.Remove(clientId);
-                m_ConnectedPeersByIDs.Remove(peerID);
-                m_MessageRecipients.Remove(peerID);
-
-                if (LogLevel <= LogLevel.Developer)
-                    Debug.Log($"[{this.GetType().Name}] - Disconnecting remote client with ID {clientId}.");
+                if (LogLevel <= LogLevel.Normal)
+                    Debug.LogWarning($"[{this.GetType().Name}] - Failed to disconnect remote client with ID {clientId}, client not connected.");
+                return;
             }
-            else if (LogLevel <= LogLevel.Normal)
-                Debug.LogWarning($"[{this.GetType().Name}] - Failed to disconnect remote client with ID {clientId}, client not connected.");
+
+            TransportLevelMessages.SendDisconnectRequest(peerID);
+
+            m_ConnectedPeers.Remove(clientId);
+            m_ConnectedPeersByIDs.Remove(peerID);
+            m_MessageRecipients.Remove(peerID);
+
+            // also remove all peers that relay through the disconnected peer
+            foreach (var key in m_MessageRecipients.Keys)
+            {
+                if (m_MessageRecipients[key] == peerID)
+                    m_MessageRecipients.Remove(key);
+                if (m_ConnectedPeersByIDs.Remove(key, out ulong peerClientId))
+                    m_ConnectedPeers.Remove(peerClientId);
+            }
+
+            if (LogLevel <= LogLevel.Developer)
+                Debug.Log($"[{this.GetType().Name}] - Disconnecting remote client with ID {clientId}.");
         }
 
         public override void Send(ulong clientId, ArraySegment<byte> data, NetworkDelivery delivery)
@@ -320,19 +317,7 @@ namespace Netcode.LocalPeerToPeer
 
         protected void ReceivedInvitation(PeerInvitation invitation)
         {
-// avoid cycles
-// TODO: and avoid other impossible situations
-/*
-// Don't accept if we're already connected
-// Always accept if we haven't sent our own invitation to the peer
-// Otherwise accept if our ID is lower than theirs so that only one peer accepts
-BOOL shouldAccept = ![m_Session.connectedPeers containsObject:mcPeerID] &&
-        ((!knownByID) || [peerInfo.peerID compare:m_PeerInfo.peerID] == NSOrderedDescending);
-
-`PickServer` aborts if a server is connecting as a client to a relay, and if
-the other server would connect to it instead (i.e. only allow one server to
-connect to a relay of the other)
-*/
+            // be careful before accepting the invitation
             var sendInvitation = !m_MessageRecipients.ContainsKey(invitation.PeerID);
             PickServerDecision decision = default;
             if (sendInvitation)
@@ -383,65 +368,17 @@ connect to a relay of the other)
             PickServerDecision decision;
             if (m_PendingConnections.TryGetValue(peer.PeerID, out decision))
             {
-// TODO: handle the decision
+                FinalizePeerConnected(peer, decision);
                 TransportLevelMessages.SendPickServerDecision(peer.PeerID, decision);
             }
             else
             {
-                TransportLevelMessages.WaitForTransportLevelMessageFrom(peer.PeerID, TransportLevelMessageType.PickServerDecision, payload =>
+                // receive the decision from the invited peer
+                StartCoroutine(TransportLevelMessages.WaitForTransportLevelMessageFrom(peer.PeerID, TransportLevelMessageType.PickServerDecision, payload =>
                 {
-// TODO: handle the decision
-                });
+                    FinalizePeerConnected(peer, decision);
+                }));
             }
-
-            if (!decision.Connect)
-            {
-// FIXME: telling the remote client to disconnect *doesn't work* because
-// Multipeer Connectivity doesn't allow you to disconnect a peer from a session!
-/*
-How this needs to work:
-
-An browser sees an advertiser, and asks whether to join. The advertiser's data
-is not up to date; i.e. it doesn't know whether the advertiser is/has a server,
-etc.
-
-If the query to join is accepted by the adjudicator, the browser sends an
-invitation to the advertiser. The advertiser sees the invitation and asks whether
-to accept. The invitation's data is up to date, including mode and server ID.
-Thus the advertiser can properly judge whether to ask whether to accept.
-
-If the adjudicator accepts the invitation, the peers join.
-
-If two unattached peers are advertising and browsing, let's go through the scenarios:
-
-1. both peers see the advertisement and record the other peer's ID:
-    - both peers send an invitation
-    - both peers receive an invitation
-    - since both peers already know about the other peer, only one of them accepts
-
-2. peer A sees the advertisement and records the other peer's ID:
-    - peer A sends an invitation
-    - peer B receives an invitation before seeing peer A's advertisement
-    - since peer B doesn't know about peer A, peer B accepts
-
-From a peer's perspective, when I receive an invitation I either know about the
-other peer or I don't. If I do then I accept conditionally.
-*/
-                DisconnectRemoteClient(m_ConnectedPeersByIDs[peer.PeerID]);
-                // TODO: clear out dictionaries too
-                return;
-            }
-
-            if (decision.Mode == PeerMode.Server)
-                this.RelayPeerID = default;
-            else if (decision.Mode == PeerMode.Client)
-                this.RelayPeerID = decision.PickedPeerID == this.PeerID ? default : decision.PickedPeerID;
-            this.ServerPeerID = decision.ServerPeerID;
-
-            if (decision.PickedPeerID == PeerID && decision.Mode == PeerMode.Server)
-                RunAsServer();
-            else
-                RunAsClient();
         }
 
         protected internal virtual void RelayedPeerConnected(Guid peerID, Guid relayerPeerID, ArraySegment<byte> payload)
@@ -454,7 +391,27 @@ other peer or I don't. If I do then I accept conditionally.
             if (NetworkManager.Singleton.IsServer)
                 InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
             else
-                TransportLevelMessages.SendTransportLevelMessage(RelayOrServerPeerID, TransportLevelMessageType.RelayPeerConnected, payload, NetworkDelivery.Reliable);
+                TransportLevelMessages.SendRelayPeerConnected(peerID);
+        }
+
+        protected internal virtual void RelayedPeerDisconnected(Guid peerID, Guid relayerPeerID, ArraySegment<byte> payload)
+        {
+            if (!m_ConnectedPeersByIDs.TryGetValue(peerID, out ulong clientId))
+            {
+                if (LogLevel <= LogLevel.Error)
+                    Debug.LogError($"[{this.GetType().Name}] - Relayed peer with ID {peerID} disconnected, but they didn't have a clientId.");
+                return;
+            }
+
+            m_ConnectedPeers.Remove(clientId);
+            m_ConnectedPeersByIDs.Remove(peerID);
+            m_MessageRecipients.Remove(peerID);
+            m_PendingConnections.Remove(peerID);
+
+            if (NetworkManager.Singleton.IsServer)
+                InvokeOnTransportEvent(NetworkEvent.Disconnect, clientId, null, Time.realtimeSinceStartup);
+            else
+                TransportLevelMessages.SendRelayPeerDisconnected(peerID);
         }
 
         protected void ReceivedPeerMessage(Guid fromPeerID, ArraySegment<byte> payload)
@@ -469,10 +426,23 @@ other peer or I don't. If I do then I accept conditionally.
 
         protected void PeerDisconnected(PeerInfo peer)
         {
+            if (!m_ConnectedPeersByIDs.TryGetValue(peer.PeerID, out ulong clientId))
+            {
+                if (LogLevel <= LogLevel.Error)
+                    Debug.LogError($"[{this.GetType().Name}] - Peer {peer.DisplayName} with ID {peer.PeerID} disconnected, but they didn't have a clientId.");
+                return;
+            }
+
+            m_ConnectedPeers.Remove(clientId);
+            m_ConnectedPeersByIDs.Remove(peer.PeerID);
+            m_MessageRecipients.Remove(peer.PeerID);
+            m_PendingConnections.Remove(peer.PeerID);
+            InvokeOnTransportEvent(NetworkEvent.Disconnect, clientId, null, Time.realtimeSinceStartup);
+
             if (peer.PeerID == RelayPeerID || peer.PeerID == ServerPeerID)
-                LostConnectionToServer(peer);
+                LostConnectionToServer(peer, clientId);
             else
-                LostConnectionToClient(peer);
+                LostConnectionToClient(peer, clientId);
         }
 
         #endregion
@@ -503,12 +473,7 @@ other peer or I don't. If I do then I accept conditionally.
 
             StartMode = mode;
 
-            if (mode == PeerMode.Server)
-                RunAsServer();
-            else if (mode == PeerMode.Client)
-                RunAsClient();
-            else
-                RunAsPeerToPeer();
+            RunWithMode(mode);
 
             Started = true;
             return true;
@@ -527,25 +492,17 @@ other peer or I don't. If I do then I accept conditionally.
             return component;
         }
 
-        protected virtual void RunAsPeerToPeer()
+        protected virtual bool RunWithMode(PeerMode mode)
         {
-            if (!ShouldChangeModeTo(PeerMode.PeerToPeer))
-                return;
-            m_ChangeModeCoroutine = StartCoroutine(DoRunAsPeerToPeer());
-        }
-
-        protected virtual void RunAsServer()
-        {
-            if (!ShouldChangeModeTo(PeerMode.Server))
-                return;
-            m_ChangeModeCoroutine = StartCoroutine(DoRunAsServer());
-        }
-
-        protected virtual void RunAsClient()
-        {
-            if (!ShouldChangeModeTo(PeerMode.Client))
-                return;
-            m_ChangeModeCoroutine = StartCoroutine(DoRunAsClient());
+            if (!ShouldChangeModeTo(mode))
+                return false;
+            if (mode == PeerMode.PeerToPeer)
+                m_ChangeModeCoroutine = StartCoroutine(DoRunAsPeerToPeer());
+            else if (mode == PeerMode.Server)
+                m_ChangeModeCoroutine = StartCoroutine(DoRunAsServer());
+            else if (mode == PeerMode.Client)
+                m_ChangeModeCoroutine = StartCoroutine(DoRunAsClient());
+            return true;
         }
 
         protected virtual bool ShouldChangeModeTo(PeerMode mode)
@@ -582,11 +539,13 @@ other peer or I don't. If I do then I accept conditionally.
             if (!NetworkManager.Singleton.IsListening)
                 NetworkManager.Singleton.StartHost();
             // notify the network manager of all known clients
+            // and notify all clients that we're now the server
             foreach (var clientId in m_ConnectedPeers.Keys)
             {
                 if (clientId == ServerClientId)
                     continue;
                 InvokeOnTransportEvent(NetworkEvent.Connect, clientId, null, Time.realtimeSinceStartup);
+                TransportLevelMessages.SendServerChanged(m_ConnectedPeers[clientId]);
             }
             Advertising = DirectlyConnectedPeerCount < PeerLimit;
             Discovering = StartMode == PeerMode.PeerToPeer; // servers need to discover other servers
@@ -623,38 +582,71 @@ other peer or I don't. If I do then I accept conditionally.
             m_SuspendDisconnectingClients = false;
         }
 
-        protected virtual void LostConnectionToClient(PeerInfo peer)
+        protected virtual void LostConnectionToClient(PeerInfo peer, ulong clientId)
         {
-            if (!m_ConnectedPeersByIDs.TryGetValue(peer.PeerID, out ulong clientId))
+            // also remove all peers that relay through the disconnected peer
+            foreach (var peerID in m_MessageRecipients.Keys)
             {
-                if (LogLevel <= LogLevel.Error)
-                    Debug.LogError($"[{this.GetType().Name}] - Peer {peer.DisplayName} with ID {peer.PeerID} disconnected, but they weren't a client.");
-                return;
+                if (m_MessageRecipients[peerID] == peer.PeerID)
+                {
+                    m_MessageRecipients.Remove(peerID);
+                    TransportLevelMessages.SendRelayPeerDisconnected(peerID);
+                    if (m_ConnectedPeersByIDs.Remove(peerID, out ulong peerClientId))
+                    {
+                        m_ConnectedPeers.Remove(peerClientId);
+                        InvokeOnTransportEvent(NetworkEvent.Disconnect, peerClientId, null, Time.realtimeSinceStartup);
+                    }
+                }
             }
 
-            InvokeOnTransportEvent(NetworkEvent.Disconnect, clientId, null, Time.realtimeSinceStartup);
-            m_ConnectedPeers.Remove(clientId);
-            m_ConnectedPeersByIDs.Remove(peer.PeerID);
-            m_MessageRecipients.Remove(peer.PeerID);
-
-            if (m_ConnectedPeers.Count == 0)
-            {
-                // if (!ServerOnly)
-                //     Discovering = true;
-
-                /*
-                TODO:
-                - start browsing for peers
-                - (after a delay?) call `NetworkManager.Shutdown`
-                    - what happens to the game objects? transfer control...?
-                - the mode becomes `pairing` again
-                */
-            } else if (!Advertising && DirectlyConnectedPeerCount < PeerLimit)
+            if (!Advertising && DirectlyConnectedPeerCount < PeerLimit)
                 Advertising = true; // since we made some room
         }
 
-        protected virtual void LostConnectionToServer(PeerInfo peer)
+        protected virtual void LostConnectionToServer(PeerInfo peer, ulong clientId)
         {
+            this.ServerPeerID = default;
+            if (peer.PeerID == this.RelayPeerID)
+                this.RelayPeerID = default;
+
+            if (this.IsRelayer && !this.IsRelayed)
+            {
+                RunWithMode(PeerMode.Server);
+            }
+            else if (!this.IsRelayed)
+            {
+                RunWithMode(PeerMode.PeerToPeer);
+                // TODO: take ownership somehow
+            }
+            // otherwise if relayed, just wait around for a new server
+
+/*
+TODO: things we could do:
+
+- immediately become a server (necessary if we're a relay)
+    - this means that each of a former server's direct peers will become a server,
+      leading to seven new servers
+- remain a solo client and shut down or take ownership of netcode
+    - in the mean time hunt for peers
+- remain a client and rely on a different peer (like the top relayer) to become
+  a server
+- remain a client and wait around for a different server
+
+I feel like if we have a relay hierarchy left, we should make the top relayer
+into a server right away, and then depend on discovery to merge servers. This
+leads to jumps in NPC movement but hopefully won't be too bad.
+
+If we don't have a relay hierarchy then by definition we're unconnected and we
+can remain a client.
+
+So if we're a top relayer we immediately become a server and send a message to
+all connected clients about it.
+
+If we're not connected to a relayer then we so something like take ownership.
+
+If we're connected to a relayer we just wait around for another server.
+*/
+
             /*
             TODO:
             - immediately take over animation, physics, AI, etc.?
@@ -678,6 +670,26 @@ other peer or I don't. If I do then I accept conditionally.
         protected internal void SetPeerReachedThrough(Guid peerID, Guid throughPeerID)
         {
             m_MessageRecipients[peerID] = throughPeerID;
+        }
+
+        protected virtual void FinalizePeerConnected(PeerInfo peer, PickServerDecision decision)
+        {
+            if (decision.PickedPeerID != this.PeerID)
+            {
+                this.ServerPeerID = decision.ServerPeerID;
+                if (decision.Mode == PeerMode.Client)
+                    this.RelayPeerID = decision.PickedPeerID;
+            }
+
+            bool changedMode;
+            if (decision.PickedPeerID == PeerID && decision.Mode == PeerMode.Server)
+                changedMode = RunWithMode(PeerMode.Server);
+            else
+                changedMode = RunWithMode(PeerMode.Client);
+
+            if (!changedMode)
+                InvokeOnTransportEvent(NetworkEvent.Connect, m_ConnectedPeersByIDs[peer.PeerID], null, Time.realtimeSinceStartup);
+            // otherwise the events are invoked by RunWithMode
         }
 
         #endregion
